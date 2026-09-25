@@ -1,0 +1,23 @@
+name: Codex issue flow
+
+on:
+  issues:
+    types: [opened]
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  codex:
+    if: ${{ github.event.issue.user.login == 'daiksud' }}
+    runs-on: [self-hosted, macOS, ARM64]
+    concurrency:
+      group: codex-issue-${{ github.repository_id }}
+      queue: max
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          clean: true
+          persist-credentials: true
