@@ -12,6 +12,7 @@ jobs:
   codex:
     if: ${{ github.event.issue.user.login == 'daiksud' }}
     runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 1439
     concurrency:
       group: codex-issue-${{ github.repository_id }}
       queue: max

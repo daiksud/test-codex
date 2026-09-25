@@ -38,6 +38,13 @@ test("Issue processing uses an author guard and job-level concurrency", () => {
   assert.doesNotMatch(workflow, /^concurrency:\n/m);
 });
 
+test("the Codex job timeout stays below 24 hours", () => {
+  const jobs = blockAtIndent(workflow, 0, "jobs");
+  const processingJob = blockAtIndent(jobs, 2, "codex");
+
+  assert.match(processingJob, /^    timeout-minutes: 1439$/m);
+});
+
 test("Codex starts from a clean main checkout in the default workspace", () => {
   const jobs = blockAtIndent(workflow, 0, "jobs");
   const processingJob = blockAtIndent(jobs, 2, "codex");
