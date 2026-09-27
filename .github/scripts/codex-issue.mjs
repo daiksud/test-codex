@@ -687,6 +687,24 @@ export async function postApprovedIssuePlan(session, approval, {
   }
 }
 
+export async function startApprovedIssueDelivery(session, {
+  waitForApproval = waitForIssuePlanApproval,
+  postPlan = postApprovedIssuePlan,
+  startImplementation = startApprovedIssueImplementation,
+} = {}) {
+  const { client, deadline } = session;
+  async function bounded(operation) {
+    if (deadline.expired) throw deadline.error;
+    const result = await Promise.race([deadline.expiration, client.failure, operation()]);
+    if (deadline.expired) throw deadline.error;
+    return result;
+  }
+  const approval = await bounded(() => waitForApproval(session));
+  const receipt = await bounded(() => postPlan(session, approval));
+  const turnId = await bounded(() => startImplementation(session, approval, receipt));
+  return { session, approval, receipt, turnId };
+}
+
 function requireApprovedIssueReceipt(session, approval, receipt) {
   const { issue, threadId } = session;
   if (typeof threadId !== "string" || !threadId ||
