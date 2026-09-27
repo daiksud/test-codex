@@ -478,6 +478,54 @@ export async function runIssuePlanCli({
   }
 }
 
+export async function waitForIssuePlanApproval(session) {
+  const { client, deadline, threadId, turnId: planTurnId } = session;
+  const prefix = "PLEASE IMPLEMENT THIS PLAN:\n";
+  let approval = null;
+  async function bounded(operation) {
+    if (deadline.expired) throw deadline.error;
+    const result = await Promise.race([
+      deadline.expiration, client.failure, operation(),
+    ]);
+    if (deadline.expired) throw deadline.error;
+    return result;
+  }
+  while (true) {
+    const event = await bounded(() => client.nextEvent());
+    const params = event?.params ?? {};
+    if (params.threadId !== threadId) continue;
+    if ((event.method === "item/started" || event.method === "item/completed") &&
+        params.item?.type === "fileChange") {
+      throw new Error("Approval turn must not modify files before Plan publication");
+    }
+    if (approval) {
+      if (event.method === "turn/completed" &&
+          params.turn?.id === approval.approvalTurnId) {
+        if (!["completed", "interrupted"].includes(params.turn.status)) {
+          throw new Error(`Approval turn ended with status ${params.turn.status ?? "unknown"}`);
+        }
+        return approval;
+      }
+      continue;
+    }
+    if (!["item/started", "item/completed"].includes(event.method) ||
+        params.turnId === planTurnId || params.item?.type !== "userMessage") continue;
+    const content = params.item.content;
+    if (!Array.isArray(content) || content.length !== 1 || content[0]?.type !== "text") continue;
+    const text = content[0].text;
+    if (typeof text !== "string" || !text.startsWith(prefix)) continue;
+    const approvedPlan = text.slice(prefix.length);
+    if (!approvedPlan.trim()) throw new Error("Approved Plan is empty");
+    if (typeof params.turnId !== "string" || !params.turnId) {
+      throw new Error("Approval message has no turn ID");
+    }
+    approval = { approvedPlan, approvalTurnId: params.turnId };
+    await bounded(() => client.request("turn/interrupt", {
+      threadId, turnId: approval.approvalTurnId,
+    }));
+  }
+}
+
 function issuePlanPrompt(issue) {
   return [
     `Plan the work described in GitHub Issue #${issue.number}: ${issue.title}`,
