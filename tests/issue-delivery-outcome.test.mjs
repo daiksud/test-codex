@@ -72,3 +72,28 @@ for (const stop of ["deadline", "transport"]) {
     }
   });
 }
+
+test("retries transient remote audits with the same report and one turn observation until they pass", async () => {
+  const fake = fixture(); let audits = 0, capturedReport; const delays = [];
+  fake.options.waitBeforeRetry = async (delay, context) => { delays.push(delay); assert.equal(context.client, fake.session.client); assert.equal(context.deadline, fake.session.deadline); };
+  fake.options.auditDelivery = async (session, approval, receipt, parsed) => {
+    assert.equal(session, fake.session); assert.equal(approval, fake.handoff.approval); assert.equal(receipt, fake.handoff.receipt);
+    if (capturedReport) assert.equal(parsed, capturedReport); else capturedReport = parsed;
+    if (++audits <= 8) throw Object.assign(new Error("temporary read failure"), { retryable: true, delayMs: audits === 1 ? 7000 : null });
+    return fake.evidence;
+  };
+  assert.deepEqual(await observe(fake), { turn: fake.turn, report, remoteEvidence: fake.evidence });
+  assert.equal(audits, 9); assert.deepEqual(fake.calls, ["observe"]);
+  assert.deepEqual(delays, [7000, 2000, 4000, 8000, 16000, 32000, 60000, 60000]);
+});
+
+for (const stop of ["deadline", "transport"]) {
+  test(`${stop} during audit retry backoff never repeats the audit after a late wait`, async () => {
+    const fake = fixture(); let audits = 0, finish;
+    fake.options.auditDelivery = async () => { audits += 1; throw Object.assign(new Error("temporary read failure"), { retryable: true }); };
+    fake.options.waitBeforeRetry = async () => new Promise(resolve => { finish = resolve; });
+    const operation = observe(fake); const rejected = assert.rejects(operation, stop === "deadline" ? /deadline expired/ : /transport lost/); rejected.catch(() => {}); await setImmediate();
+    assert.equal(typeof finish, "function", "transient audit failure must enter backoff");
+    if (stop === "deadline") fake.expire(); else fake.fail(); finish(); await rejected; await setImmediate(); assert.equal(audits, 1); assert.deepEqual(fake.calls, ["observe"]);
+  });
+}

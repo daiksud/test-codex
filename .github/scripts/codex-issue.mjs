@@ -709,14 +709,26 @@ export async function startApprovedIssueDelivery(session, {
 export async function observeIssueDelivery(handoff, {
   readTurn = readIssueImplementationTurn,
   auditDelivery = verifyIssueDelivery,
+  waitBeforeRetry = waitForIssueRetry,
 } = {}) {
   const { session, approval, receipt, turnId } = handoff;
   const turn = await runIssueSessionStage(session, () => readTurn(session, turnId));
   if (turn.status !== "completed") return { turn, report: null, remoteEvidence: null };
   const report = parseIssueDeliveryReport(turn);
-  const remoteEvidence = report.status === "complete" ?
-    await runIssueSessionStage(session, () => auditDelivery(session, approval, receipt, report)) : null;
-  return { turn, report, remoteEvidence };
+  if (report.status !== "complete") return { turn, report, remoteEvidence: null };
+  let transientFailures = 0;
+  while (true) {
+    try {
+      const remoteEvidence = await runIssueSessionStage(session, () => auditDelivery(session, approval, receipt, report));
+      return { turn, report, remoteEvidence };
+    } catch (error) {
+      if (session.deadline.expired) throw session.deadline.error;
+      if (error.retryable !== true) throw error;
+      const fallback = Math.min(60000, 1000 * 2 ** transientFailures++);
+      const delayMs = error.delayMs ?? fallback;
+      await runIssueSessionStage(session, () => waitBeforeRetry(delayMs, { client: session.client, deadline: session.deadline }));
+    }
+  }
 }
 
 export async function runApprovedIssueSession(session, {
