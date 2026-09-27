@@ -1366,7 +1366,8 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
       if (!Array.isArray(comments)) throw new Error("Invalid Bot review request comments");
       for (const comment of comments) {
         const lines = typeof comment?.body === "string" ? comment.body.split(/\r?\n/) : [];
-        if (lines[0] !== "@codex review" || !lines.includes(marker)) continue;
+        if (lines[0] !== "@codex review" || !lines.includes(marker) ||
+            comment.user?.login !== "github-actions[bot]") continue;
         const createdAt = typeof comment.created_at === "string" ? Date.parse(comment.created_at) : NaN;
         const updatedAt = typeof comment.updated_at === "string" ? Date.parse(comment.updated_at) : NaN;
         if (!Number.isSafeInteger(comment.id) || comment.id <= 0 ||

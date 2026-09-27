@@ -146,6 +146,7 @@ for (const stop of ["deadline", "transport"]) {
 
 const requestComment = {
   id: 42, html_url: `https://github.com/${repository}/pull/7#issuecomment-42`,
+  user: { login: "github-actions[bot]" },
   body: `@codex review\n\n<!-- codex-issue-review:${headSha} -->`,
   created_at: "2026-09-27T00:00:00Z", updated_at: "2026-09-27T00:00:00Z",
 };
@@ -279,4 +280,19 @@ test("a non-review connector reply does not hide valid review approval or no-fin
 test("a later non-review connector reply does not erase a genuine current-head code review", async () => {
   const fake = fixture(); fake.reviews[0] = [review, { ...review, body: "" }];
   assert.deepEqual(await audit(fake), { headSha, bots: [bot.login] });
+});
+
+test("only an Actions-authored marker reaction proves this unattended request path", async () => {
+  for (const user of [undefined, null, { login: "fixture-human" }, { login: "second-review[bot]" }]) {
+    const fake = thumbFixture(); fake.reviewComments[0][0].user = user;
+    await assert.rejects(audit(fake), error => error.code === "ISSUE_DELIVERY_FINDING" && /Bot|review/i.test(error.message));
+  }
+});
+
+test("a newer untrusted request marker cannot displace an older Actions request", async () => {
+  const fake = thumbFixture();
+  fake.reviewComments[0].push({ ...requestComment, id: 43, html_url: requestComment.html_url.replace("42", "43"), user: { login: "fixture-human" }, created_at: "2026-09-27T00:00:02Z", updated_at: "2026-09-27T00:00:02Z" });
+  fake.reactions["43:1"] = [];
+  assert.deepEqual(await audit(fake), { headSha, bots: [bot.login] });
+  assert.equal(fake.calls.some(call => call.url.includes("/issues/comments/43/reactions?")), false);
 });
