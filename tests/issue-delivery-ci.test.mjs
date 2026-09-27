@@ -1,0 +1,241 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+import { setImmediate } from "node:timers/promises";
+import * as flow from "../.github/scripts/codex-issue.mjs";
+
+const repository = "daiksud/test-codex";
+const root = `https://api.github.com/repos/${repository}`;
+const headSha = "b".repeat(40);
+const facts = { repository, issueNumber: 19, pullRequestNumber: 7, headSha, mainSha: "a".repeat(40) };
+const context = "Codex verification";
+const actionsRunUrl = `https://github.com/${repository}/actions/runs/9001`;
+const status = { context, state: "success", created_at: "2026-09-27T00:00:03Z", url: root + `/statuses/${headSha}`, target_url: actionsRunUrl, creator: { login: "github-actions[bot]" } };
+const check = { completed_at: "2026-09-27T00:00:03Z", name: context, head_sha: headSha, status: "completed", conclusion: "success", app: { slug: "github-actions" }, details_url: `https://github.com/${repository}/actions/runs/9002/job/8001` };
+function fixture() {
+  const controller = new AbortController();
+  const deadline = { expired: false, expiration: new Promise(() => {}) };
+  const calls = [];
+  const payloads = {
+    [root + "/rules/branches/main"]: [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context }] } }],
+    [root + `/commits/${headSha}/statuses?per_page=100&page=1`]: [status],
+    [root + `/commits/${headSha}/check-runs?filter=latest&per_page=100&page=1`]: { check_runs: [] },
+  };
+  return { calls, payloads, controller, session: { actionsRunUrl, issue: { repository, number: 19 }, client: { failure: new Promise(() => {}) }, deadline, signal: controller.signal },
+    fetchImpl: async (url, options) => { calls.push(url); assert.equal(options.method, "GET"); assert.ok(Object.hasOwn(payloads, url), url); return { ok: true, status: 200, headers: new Headers(), json: async () => payloads[url] }; } };
+}
+function audit(fake, value = facts, options = {}) {
+  assert.equal(typeof flow.verifyIssueRequiredCi, "function");
+  return flow.verifyIssueRequiredCi(fake.session, value, { env: { GH_TOKEN: "fixture-token" }, fetchImpl: fake.fetchImpl, ...options });
+}
+function statuses(fake, values, page = 1) { fake.payloads[root + `/commits/${headSha}/statuses?per_page=100&page=${page}`] = values; }
+function checks(fake, values, page = 1) { fake.payloads[root + `/commits/${headSha}/check-runs?filter=latest&per_page=100&page=${page}`] = { check_runs: values }; }
+
+test("requires authenticated check read permission without extra write scope", () => {
+  const workflow = readFileSync(new URL("../.github/workflows/codex-issue.yml", import.meta.url), "utf8");
+  assert.match(workflow, /^      checks: read$/m);
+  assert.doesNotMatch(workflow, /^      checks: write$/m);
+});
+
+test("success statuses require the current Actions run URL and GitHub Actions creator", async () => {
+  for (const change of [
+    { target_url: null }, { target_url: undefined },
+    { target_url: actionsRunUrl.replace("9001", "9002") },
+    { target_url: "https://example.test/forged" },
+    { creator: null }, { creator: { login: "fixture-human" } },
+  ]) {
+    const fake = fixture(); statuses(fake, [{ ...status, ...change }]);
+    await assert.rejects(audit(fake), error => error.code === "ISSUE_DELIVERY_FINDING" && /provenance|Actions/i.test(error.message));
+  }
+  const unbound = fixture(); delete unbound.session.actionsRunUrl;
+  await assert.rejects(audit(unbound), /Actions|bound|run URL/i);
+  const checkOnly = fixture(); delete checkOnly.session.actionsRunUrl; statuses(checkOnly, []); checks(checkOnly, [check]);
+  assert.deepEqual(await audit(checkOnly), { headSha, requiredContext: context });
+});
+
+test("accepts status-only, check-only and both passing sources on the exact head", async () => {
+  for (const mode of ["status", "check", "both"]) {
+    for (const conclusion of ["success", "skipped", "neutral"]) {
+      const fake = fixture();
+      if (mode === "check") { statuses(fake, []); delete fake.session.actionsRunUrl; }
+      if (mode !== "status") checks(fake, [{ ...check, conclusion }]);
+      assert.deepEqual(await audit(fake), { headSha, requiredContext: context });
+    }
+  }
+});
+
+test("the Issue Actions run requires its bound status even when a trusted check passes", async () => {
+  for (const value of [check, { ...check, app: { slug: "fixture-ci" } }]) {
+    const fake = fixture(); statuses(fake, []); checks(fake, [value]);
+    await assert.rejects(audit(fake), error => error.code === "ISSUE_DELIVERY_FINDING" && /status|Actions/i.test(error.message));
+  }
+});
+
+test("outside Actions only trusted same-repository run/job checks can establish CI", async () => {
+  for (const change of [
+    { app: null }, { app: { slug: "fixture-ci" } }, { details_url: null },
+    { details_url: "https://example.test/actions/runs/9002/job/8001" },
+    { details_url: "https://github.com/fixture/other/actions/runs/9002/job/8001" },
+    { details_url: `https://github.com/${repository}/actions/runs/9002` },
+    { details_url: `https://github.com/${repository}/actions/runs/0/job/8001` },
+    { details_url: `https://github.com/${repository}/actions/runs/9002/job/0` },
+    { details_url: check.details_url + "/forged" },
+  ]) {
+    const fake = fixture(); delete fake.session.actionsRunUrl; statuses(fake, []); checks(fake, [{ ...check, ...change }]);
+    await assert.rejects(audit(fake), error => error.code === "ISSUE_DELIVERY_FINDING" && /provenance|Actions|check/i.test(error.message));
+  }
+  const trusted = fixture(); delete trusted.session.actionsRunUrl; statuses(trusted, []); checks(trusted, [check]);
+  assert.deepEqual(await audit(trusted), { headSha, requiredContext: context });
+});
+
+test("validates session-bound facts and deadline before any request", async () => {
+  for (const change of [{ repository: "fixture/other" }, { issueNumber: 20 }, { pullRequestNumber: null }, { headSha: "invalid" }]) {
+    const fake = fixture();
+    await assert.rejects(audit(fake, { ...facts, ...change }), /facts|head|Issue|repository/i);
+    assert.equal(fake.calls.length, 0);
+  }
+  const fake = fixture(); fake.session.deadline.expired = true; fake.session.deadline.error = new Error("deadline expired");
+  await assert.rejects(audit(fake), /deadline expired/); assert.equal(fake.calls.length, 0);
+});
+
+test("fails on drift of effective required context or app binding", async () => {
+  for (const rules of [[], {}, [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [] } }],
+    [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: "other" }] } }],
+    [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context }, { context: "extra" }] } }],
+    [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context, integration_id: 12 }] } }]]) {
+    const fake = fixture(); fake.payloads[root + "/rules/branches/main"] = rules;
+    await assert.rejects(audit(fake), /required|rule|binding/i);
+  }
+});
+
+test("matches current non-strict policy and rejects additional required workflows", async () => {
+  const fake = fixture();
+  fake.payloads[root + "/rules/branches/main"].push({ type: "pull_request" });
+  await audit(fake);
+  for (const change of ["strict", "workflows"]) {
+    const other = fixture();
+    if (change === "strict") other.payloads[root + "/rules/branches/main"][0].parameters.strict_required_status_checks_policy = true;
+    else other.payloads[root + "/rules/branches/main"].push({ type: "workflows", parameters: {} });
+    await assert.rejects(audit(other), /required|rule|policy|workflow/i);
+  }
+});
+
+test("missing, failed, pending, stale or malformed CI evidence never passes", async () => {
+  for (const [statusValues, checkValues] of [
+    [[], []], [[{ ...status, context: "other" }], []], [[{ ...status, state: "failure" }], [check]],
+    [[{ ...status, state: "pending" }], [check]], [[status], [{ ...check, conclusion: "failure" }]],
+    [[status], [{ ...check, status: "in_progress" }]], [[], [{ ...check, head_sha: "c".repeat(40) }]],
+    [[{ ...status, url: root + `/statuses/${"c".repeat(40)}` }], []], [[], [{ ...check, name: "other" }]],
+    [{}, []], [[], {}],
+  ]) {
+    const fake = fixture(); statuses(fake, statusValues); checks(fake, checkValues);
+    await assert.rejects(audit(fake), /CI|status|check|head|evidence/i);
+  }
+});
+
+test("uses newest status per context and paginates both sources", async () => {
+  const fake = fixture();
+  statuses(fake, [status, { ...status, state: "failure" }, ...Array.from({ length: 98 }, () => ({ ...status, context: "other" }))]);
+  statuses(fake, [{ ...status, state: "failure" }], 2);
+  checks(fake, Array.from({ length: 100 }, () => ({ ...check, name: "other" })));
+  checks(fake, [check], 2);
+  assert.deepEqual(await audit(fake), { headSha, requiredContext: context });
+  assert.equal(fake.calls.filter(url => url.endsWith("page=2")).length, 2);
+  const other = fixture(); statuses(other, [{ ...status, state: "failure" }, status]);
+  await assert.rejects(audit(other), /CI|status/i);
+});
+
+test("retries transient CI reads but does not retry authentication failures", async () => {
+  for (const code of [503, 403]) {
+    const fake = fixture(); let count = 0; const delays = [];
+    const operation = audit(fake, facts, { fetchImpl: async (url, options) => {
+      count += 1;
+      if (count === 1) return { ok: false, status: code, headers: new Headers(), json: async () => ({}) };
+      return fake.fetchImpl(url, options);
+    }, waitBeforeRetry: async ms => { delays.push(ms); } });
+    if (code === 403) { await assert.rejects(operation, /403/); assert.equal(count, 1); }
+    else { await operation; assert.deepEqual(delays, [1000]); assert.equal(count, 4); }
+  }
+});
+
+for (const stop of ["deadline", "transport"]) {
+  test(`${stop} aborts a pending CI read`, async () => {
+    const fake = fixture(); let rejectStop;
+    const stopped = new Promise((resolve, reject) => { rejectStop = reject; }); stopped.catch(() => {});
+    if (stop === "deadline") fake.session.deadline.expiration = stopped;
+    else fake.session.client.failure = stopped;
+    let signal;
+    const operation = audit(fake, facts, { fetchImpl: async (url, options) => {
+      signal = options.signal;
+      return new Promise((resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    } });
+    const rejected = assert.rejects(operation, /stopped/); rejected.catch(() => {});
+    await setImmediate();
+    if (stop === "deadline") {
+      fake.session.deadline.expired = true; fake.session.deadline.error = new Error("stopped");
+      fake.controller.abort(fake.session.deadline.error);
+    }
+    rejectStop(new Error("stopped"));
+    await rejected;
+    assert.equal(signal.aborted, true);
+  });
+}
+
+
+const mergeTime = "2026-09-27T00:00:05Z";
+
+test("status-only, check-only and mixed CI evidence can complete no later than merge", async () => {
+  for (const mode of ["status", "check", "both"]) {
+    for (const time of ["2026-09-27T00:00:03Z", mergeTime]) {
+      const fake = fixture();
+      statuses(fake, mode === "check" ? [] : [{ ...status, created_at: time }]);
+      checks(fake, mode === "status" ? [] : [{ ...check, completed_at: time }]);
+      if (mode === "check") delete fake.session.actionsRunUrl;
+      assert.deepEqual(await audit(fake, { ...facts, mergedAt: mergeTime }), { headSha, requiredContext: context });
+    }
+  }
+});
+
+test("a correctly bound status first published after merge cannot retroactively establish CI", async () => {
+  const fake = fixture();
+  statuses(fake, [{ ...status, created_at: "2026-09-27T00:00:06Z" }, status]);
+  checks(fake, [check]);
+  await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), error => error.code !== "ISSUE_DELIVERY_FINDING" && /merge|order/i.test(error.message));
+});
+
+test("late check completion cannot replace check-only or mixed pre-merge verification", async () => {
+  for (const mode of ["check", "both"]) {
+    const fake = fixture();
+    if (mode === "check") { statuses(fake, []); delete fake.session.actionsRunUrl; }
+    checks(fake, [{ ...check, completed_at: "2026-09-27T00:00:06Z" }]);
+    await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), error => error.code !== "ISSUE_DELIVERY_FINDING" && /merge|order/i.test(error.message));
+  }
+});
+
+test("post-merge CI auditing fails closed on missing or invalid status/check timestamps", async () => {
+  for (const mode of ["status", "check"]) {
+    for (const time of [undefined, null, "not a timestamp", 178]) {
+      const fake = fixture();
+      if (mode === "status") statuses(fake, [{ ...status, created_at: time }]);
+      else { statuses(fake, []); delete fake.session.actionsRunUrl; checks(fake, [{ ...check, completed_at: time }]); }
+      await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), error => error.code !== "ISSUE_DELIVERY_FINDING" && /timestamp|CI/i.test(error.message));
+    }
+  }
+});
+
+test("invalid supplied CI merge cutoffs fail before any API read", async () => {
+  for (const mergedAt of [null, "", "not a timestamp", 178]) {
+    const fake = fixture();
+    await assert.rejects(audit(fake, { ...facts, mergedAt }), /merge|cutoff|timestamp/i);
+    assert.equal(fake.calls.length, 0);
+  }
+});
+
+test("pending or failing CI retains its existing finding classification with a merge cutoff", async () => {
+  for (const mode of ["status", "check"]) {
+    const fake = fixture();
+    if (mode === "status") statuses(fake, [{ ...status, state: "pending", created_at: undefined }]);
+    else checks(fake, [{ ...check, status: "in_progress", conclusion: null, completed_at: null }]);
+    await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), error => error.code === "ISSUE_DELIVERY_FINDING");
+  }
+});
