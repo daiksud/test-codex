@@ -1225,11 +1225,22 @@ export async function verifyIssueRequiredCi(session, facts, options = {}) {
       if (check.status === "completed" && !["action_required", "cancelled", "failure", "neutral", "success", "skipped", "stale", "timed_out"].includes(check.conclusion)) {
         throw new Error("Invalid completed CI check conclusion");
       }
+      if (!latestStatus && session.actionsRunUrl == null) {
+        const runUrlPrefix = `https://github.com/${issue.repository}/actions/runs/`;
+        if (check.app?.slug !== "github-actions" || typeof check.details_url !== "string" ||
+            !check.details_url.startsWith(runUrlPrefix) ||
+            !/^[1-9]\d*\/job\/[1-9]\d*$/.test(check.details_url.slice(runUrlPrefix.length))) {
+          throw issueDeliveryFinding("Required CI check has no trusted Actions provenance");
+        }
+      }
       if (check.status !== "completed" || !["success", "skipped", "neutral"].includes(check.conclusion)) {
         throw issueDeliveryFinding("Required CI check is not successful on the exact PR head");
       }
     }
     if (response.check_runs.length < 100) break;
+  }
+  if (!latestStatus && session.actionsRunUrl != null) {
+    throw issueDeliveryFinding("This Actions session has no bound verification commit status");
   }
   if (!latestStatus && !hasCheck) throw issueDeliveryFinding("Missing required CI evidence");
   return { headSha, requiredContext: context };

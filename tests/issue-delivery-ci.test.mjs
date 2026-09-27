@@ -11,7 +11,7 @@ const facts = { repository, issueNumber: 19, pullRequestNumber: 7, headSha, main
 const context = "Codex verification";
 const actionsRunUrl = `https://github.com/${repository}/actions/runs/9001`;
 const status = { context, state: "success", url: root + `/statuses/${headSha}`, target_url: actionsRunUrl, creator: { login: "github-actions[bot]" } };
-const check = { name: context, head_sha: headSha, status: "completed", conclusion: "success" };
+const check = { name: context, head_sha: headSha, status: "completed", conclusion: "success", app: { slug: "github-actions" }, details_url: `https://github.com/${repository}/actions/runs/9002/job/8001` };
 function fixture() {
   const controller = new AbortController();
   const deadline = { expired: false, expiration: new Promise(() => {}) };
@@ -57,11 +57,35 @@ test("accepts status-only, check-only and both passing sources on the exact head
   for (const mode of ["status", "check", "both"]) {
     for (const conclusion of ["success", "skipped", "neutral"]) {
       const fake = fixture();
-      if (mode === "check") statuses(fake, []);
+      if (mode === "check") { statuses(fake, []); delete fake.session.actionsRunUrl; }
       if (mode !== "status") checks(fake, [{ ...check, conclusion }]);
       assert.deepEqual(await audit(fake), { headSha, requiredContext: context });
     }
   }
+});
+
+test("the Issue Actions run requires its bound status even when a trusted check passes", async () => {
+  for (const value of [check, { ...check, app: { slug: "fixture-ci" } }]) {
+    const fake = fixture(); statuses(fake, []); checks(fake, [value]);
+    await assert.rejects(audit(fake), error => error.code === "ISSUE_DELIVERY_FINDING" && /status|Actions/i.test(error.message));
+  }
+});
+
+test("outside Actions only trusted same-repository run/job checks can establish CI", async () => {
+  for (const change of [
+    { app: null }, { app: { slug: "fixture-ci" } }, { details_url: null },
+    { details_url: "https://example.test/actions/runs/9002/job/8001" },
+    { details_url: "https://github.com/fixture/other/actions/runs/9002/job/8001" },
+    { details_url: `https://github.com/${repository}/actions/runs/9002` },
+    { details_url: `https://github.com/${repository}/actions/runs/0/job/8001` },
+    { details_url: `https://github.com/${repository}/actions/runs/9002/job/0` },
+    { details_url: check.details_url + "/forged" },
+  ]) {
+    const fake = fixture(); delete fake.session.actionsRunUrl; statuses(fake, []); checks(fake, [{ ...check, ...change }]);
+    await assert.rejects(audit(fake), error => error.code === "ISSUE_DELIVERY_FINDING" && /provenance|Actions|check/i.test(error.message));
+  }
+  const trusted = fixture(); delete trusted.session.actionsRunUrl; statuses(trusted, []); checks(trusted, [check]);
+  assert.deepEqual(await audit(trusted), { headSha, requiredContext: context });
 });
 
 test("validates session-bound facts and deadline before any request", async () => {
