@@ -149,18 +149,41 @@ test("inspects remote state after an uncertain POST instead of posting twice", a
   }
 });
 
-test("stops if the uncertain POST cannot be inspected successfully", async () => {
+test("retries inspection after an unknown POST until it finds the saved Plan without posting twice", async () => {
   const fake = fixture();
   const methods = [];
-  await assert.rejects(publish(fake.session, {
+  const delays = [];
+  const result = await publish(fake.session, {
     fetchImpl: async (url, options) => {
       methods.push(options.method);
       if (options.method === "POST") throw new TypeError("fetch failed after sending");
-      return methods.length === 1 ? response(200, []) : response(503, {});
-    }, waitBeforeRetry: async () => {},
-  }), /503|inspect/);
-  assert.deepEqual(methods, ["GET", "POST", "GET"]);
+      if (methods.length === 1) return response(200, []);
+      if (methods.length <= 6) return response(503, {});
+      return response(200, [comment()]);
+    },
+    waitBeforeRetry: async ms => { delays.push(ms); },
+  });
+  assert.deepEqual(result, expectedReceipt());
+  assert.deepEqual(methods, ["GET", "POST", "GET", "GET", "GET", "GET", "GET"]);
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000, 16000]);
 });
+
+for (const invalid of [403, "malformed"]) {
+  test(`permanent inspection failure after unknown POST (${invalid}) never posts again`, async () => {
+    const fake = fixture();
+    const methods = [];
+    await assert.rejects(publish(fake.session, {
+      fetchImpl: async (url, options) => {
+        methods.push(options.method);
+        if (options.method === "POST") throw new TypeError("fetch failed after sending");
+        if (methods.length === 1) return response(200, []);
+        return invalid === 403 ? response(403, {}) : response(200, {});
+      },
+      waitBeforeRetry: async () => {},
+    }), /403|inspect/i);
+    assert.deepEqual(methods, ["GET", "POST", "GET"]);
+  });
+}
 
 test("retries an uncertain POST only after inspection confirms no saved Plan", async () => {
   for (const outcome of ["network failure", "HTTP 503"]) {
@@ -249,39 +272,68 @@ test("applies rate-limit and permanent-error handling to POST as well as GET", a
   }
 });
 
-test("does not retry permanent failures or exceed three publication attempts", async () => {
-  for (const status of [401, 403, 404, 422, 503]) {
+test("does not retry permanent publication errors", async () => {
+  for (const status of [401, 403, 404, 422]) {
     const fake = fixture();
     let count = 0;
     const delays = [];
     await assert.rejects(publish(fake.session, {
-      fetchImpl: async () => { count += 1; return response(status, { message: "private error detail" }); },
+      fetchImpl: async () => {
+        count += 1;
+        return response(status, { message: "private error detail" });
+      },
       waitBeforeRetry: async ms => { delays.push(ms); },
     }), error => {
       assert.match(error.message, new RegExp(String(status)));
       assert.equal(error.message.includes("private error detail"), false);
       return true;
     });
-    assert.equal(count, status === 503 ? 3 : 1);
-    assert.deepEqual(delays, status === 503 ? [1000, 2000] : []);
+    assert.equal(count, 1);
+    assert.deepEqual(delays, []);
   }
+});
+
+for (const method of ["GET", "POST"]) {
+  test(`transient ${method} publication errors continue beyond three attempts until success`, async () => {
+    const fake = fixture();
+    const methods = [];
+    const delays = [];
+    let failures = 0;
+    const result = await publish(fake.session, {
+      fetchImpl: async (url, options) => {
+        methods.push(options.method);
+        if (options.method === method && failures++ < 8) return response(503, {});
+        return options.method === "POST" ? response(201, comment()) : response(200, []);
+      },
+      waitBeforeRetry: async ms => { delays.push(ms); },
+    });
+    assert.deepEqual(result, expectedReceipt());
+    assert.deepEqual(delays, [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000]);
+    if (method === "GET") {
+      assert.equal(methods.filter(value => value === "POST").length, 1);
+      assert.equal(methods.filter(value => value === "GET").length, 9);
+    } else {
+      assert.equal(methods.length, 18);
+      for (let index = 0; index < methods.length; index += 2) {
+        assert.deepEqual(methods.slice(index, index + 2), ["GET", "POST"]);
+      }
+    }
+  });
+}
+
+test("original deadline ends transient publication retries without another request", async () => {
   const fake = fixture();
-  let posts = 0;
-  let reads = 0;
+  let count = 0;
   const delays = [];
   await assert.rejects(publish(fake.session, {
-    fetchImpl: async (url, options) => {
-      if (options.method === "GET") {
-        reads += 1;
-        return response(200, []);
-      }
-      posts += 1;
-      return response(posts <= 3 ? 503 : 403, {});
-    }, waitBeforeRetry: async ms => { delays.push(ms); },
-  }), /503/);
-  assert.equal(posts, 3);
-  assert.equal(reads, 3);
-  assert.deepEqual(delays, [1000, 2000]);
+    fetchImpl: async () => { count += 1; return response(503, {}); },
+    waitBeforeRetry: async ms => {
+      delays.push(ms);
+      if (delays.length === 5) fake.expire();
+    },
+  }), /deadline expired/);
+  assert.equal(count, 5);
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000, 16000]);
 });
 
 test("rejects missing credentials and invalid comment responses before write permission", async () => {
@@ -347,4 +399,41 @@ test("makes no API call for an already expired Issue", async () => {
     fetchImpl: async () => { calls += 1; },
   }), /deadline expired/);
   assert.equal(calls, 0);
+});
+
+test("huge Retry-After cannot overflow the default timer into an early retry", async () => {
+  const fake = fixture();
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const timers = [];
+  let requests = 0;
+  let publication;
+  globalThis.setTimeout = (callback, delayMs) => {
+    const timer = { callback, delayMs, cleared: false };
+    timers.push(timer);
+    return timer;
+  };
+  globalThis.clearTimeout = timer => { timer.cleared = true; };
+  try {
+    publication = publish(fake.session, {
+      fetchImpl: async () => {
+        requests += 1;
+        return response(503, {}, { "retry-after": "2147484" });
+      },
+    });
+    publication.catch(() => {});
+    await setImmediate();
+    assert.equal(timers.length, 1);
+    assert.ok(timers[0].delayMs > 0 && timers[0].delayMs <= issueFlow.MAX_ISSUE_RUNTIME_MS,
+      "default retry timer must stay below the native overflow limit and original Issue budget");
+    fake.expire();
+    await assert.rejects(publication, /deadline expired/);
+    assert.equal(requests, 1);
+    assert.equal(timers[0].cleared, true);
+  } finally {
+    fake.expire();
+    await publication?.catch(() => {});
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
 });

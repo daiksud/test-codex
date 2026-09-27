@@ -667,10 +667,7 @@ export async function postApprovedIssuePlan(session, approval, {
       repository, issueNumber, approvedPlan,
     };
   }
-  let uncertainPost = false;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    let inspected = false;
-    let posted = false;
+  for (let attempt = 1; ; attempt += 1) {
     try {
       for (let page = 1; ; page += 1) {
         const comments = await request(`${endpoint}?per_page=100&page=${page}`, "GET");
@@ -679,16 +676,12 @@ export async function postApprovedIssuePlan(session, approval, {
         if (existing) return result(existing);
         if (comments.length < 100) break;
       }
-      inspected = true;
-      uncertainPost = false;
-      posted = true;
       return result(await request(endpoint, "POST", { body }));
     } catch (error) {
       if (deadline.expired) throw deadline.error;
       lifetime.throwIfAborted();
-      if ((!inspected && uncertainPost) || !error.retryable || attempt === 3) throw error;
-      if (posted) uncertainPost = true;
-      await bounded(() => waitBeforeRetry(error.delayMs ?? 1000 * 2 ** (attempt - 1), { client, deadline }));
+      if (!error.retryable) throw error;
+      await bounded(() => waitBeforeRetry(error.delayMs ?? Math.min(60000, 1000 * 2 ** (attempt - 1)), { client, deadline }));
     }
   }
 }
@@ -1306,7 +1299,7 @@ async function waitForIssueRetry(delayMs, { client, deadline }) {
   let timer;
   try {
     await Promise.race([
-      new Promise((resolve) => { timer = setTimeout(resolve, delayMs); }),
+      new Promise((resolve) => { timer = setTimeout(resolve, Math.min(delayMs, MAX_ISSUE_RUNTIME_MS)); }),
       client.failure,
       ...(deadline ? [deadline.expiration] : []),
     ]);
