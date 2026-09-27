@@ -197,7 +197,10 @@ test("starts one Plan session from the GitHub issue event and retains its client
   });
 
   assert.equal(receivedEventPath, eventPath);
-  assert.deepEqual(createdClients, [{ workspace }]);
+  assert.equal(createdClients.length, 1);
+  assert.equal(createdClients[0].workspace, workspace);
+  assert.ok(createdClients[0].signal instanceof AbortSignal);
+  assert.equal(createdClients[0].signal.aborted, false);
   assert.equal(session.status, "started");
   assert.equal(session.remainingMs, 24 * 60 * 60 * 1000);
   assert.equal(session.client, client);
@@ -310,6 +313,44 @@ test("expired Issue does not create an app-server client", async () => {
   });
   assert.equal(createdClients, 0);
   assert.equal(deadlineScheduler.tasks.length, 0);
+});
+
+test("bounds asynchronous client preparation by the original Issue deadline", async () => {
+  const deadlineScheduler = createFakeDeadlineScheduler();
+  const client = new FakeAppServer();
+  let resolvePreparation;
+  let signal;
+  const startup = requireStartIssuePlanSession()({
+    eventPath, workspace, nowMs: Date.parse(issueCreatedAt), deadlineScheduler,
+    readEvent: () => issueEvent,
+    createClient: (options) => {
+      signal = options.signal;
+      return new Promise(resolve => { resolvePreparation = resolve; });
+    },
+  });
+  const failure = assert.rejects(startup, /Issue deadline expired/);
+  failure.catch(() => {});
+  await setImmediate();
+  deadlineScheduler.fire();
+  await failure;
+  assert.equal(signal.aborted, true);
+  resolvePreparation(client);
+  await setImmediate();
+  assert.equal(client.closeCount, 1);
+  assert.equal(client.requests.length, 0);
+});
+
+test("awaits asynchronous client preparation before starting Plan", async () => {
+  const deadlineScheduler = createFakeDeadlineScheduler();
+  const client = new FakeAppServer();
+  const session = await requireStartIssuePlanSession()({
+    eventPath, workspace, nowMs: Date.parse(issueCreatedAt), deadlineScheduler,
+    readEvent: () => issueEvent, createClient: async () => client,
+  });
+  assert.equal(session.client, client);
+  assert.equal(session.plan, planText);
+  session.deadline.cancel();
+  client.close();
 });
 
 test("Issue deadline expires during Plan, closes the client once, and rejects startup", async () => {

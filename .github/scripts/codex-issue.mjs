@@ -1,12 +1,39 @@
-import { spawn as spawnChild } from "node:child_process";
+import { execFile, spawn as spawnChild } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 export const MAX_ISSUE_RUNTIME_MS = 24 * 60 * 60 * 1000;
 const MAX_PLAN_ATTEMPTS = 3;
 
-export function spawnCodexAppServer({ workspace, spawnProcess = spawnChild }) {
+export async function createCodexAppServer({
+  workspace, signal, executeFile = promisify(execFile), spawnProcess = spawnChild,
+}) {
+  let servers;
+  try {
+    const { stdout } = await executeFile(
+      "codex", ["--disable", "apps", "--disable", "plugins", "mcp", "list", "--json"],
+      { cwd: workspace, signal, timeout: 10000, maxBuffer: 1024 * 1024 },
+    );
+    servers = JSON.parse(stdout);
+    if (!Array.isArray(servers) || servers.some(server =>
+      typeof server?.name !== "string" || server.name.length === 0)) {
+      throw new Error("Invalid MCP server list");
+    }
+  } catch {
+    signal?.throwIfAborted();
+    throw new Error("Cannot inspect Codex MCP configuration");
+  }
+  signal?.throwIfAborted();
+  return spawnCodexAppServer({
+    workspace, spawnProcess, mcpServerNames: servers.map(server => server.name),
+  });
+}
+
+export function spawnCodexAppServer({
+  workspace, spawnProcess = spawnChild, mcpServerNames = [],
+}) {
   const child = spawnProcess(
     "codex",
     [
@@ -16,10 +43,10 @@ export function spawnCodexAppServer({ workspace, spawnProcess = spawnChild }) {
       "apps",
       "--disable",
       "plugins",
-      "-c",
-      "mcp_servers.computer-use.enabled=false",
-      "-c",
-      "mcp_servers.node_repl.enabled=false",
+      ...(mcpServerNames.length ? [
+        "-c",
+        `mcp_servers={${mcpServerNames.map(name => `${JSON.stringify(name)}={enabled=false}`).join(",")}}`,
+      ] : []),
     ],
     { cwd: workspace, stdio: ["pipe", "pipe", "inherit"] },
   );
@@ -287,7 +314,7 @@ export async function startIssuePlanSession({
   workspace = env.GITHUB_WORKSPACE,
   nowMs,
   readEvent = readIssueEvent,
-  createClient = spawnCodexAppServer,
+  createClient = createCodexAppServer,
   deadlineScheduler = globalThis,
 } = {}) {
   if (typeof eventPath !== "string" || eventPath.trim().length === 0) {
@@ -303,6 +330,7 @@ export async function startIssuePlanSession({
   let client;
   let clientClosed = false;
   let deadline;
+  const preparation = new AbortController();
   const closeClient = () => {
     if (!client || clientClosed) return;
     clientClosed = true;
@@ -313,16 +341,22 @@ export async function startIssuePlanSession({
     preflight = startCodexIfWithinDeadline(
       issue.createdAt,
       currentTimeMs,
-      (remainingMs) => {
+      async (remainingMs) => {
         deadline = startIssueDeadline(
           remainingMs,
           deadlineScheduler,
           issue,
-          closeClient,
+          (error) => {
+            preparation.abort(error);
+            closeClient();
+          },
         );
         if (deadline.expired) throw deadline.error;
-        client = createClient({ workspace });
-        if (deadline.expired) closeClient();
+        client = await createClient({ workspace, signal: preparation.signal });
+        if (deadline.expired) {
+          closeClient();
+          throw deadline.error;
+        }
         return client;
       },
     );
@@ -334,6 +368,7 @@ export async function startIssuePlanSession({
   if (preflight.status === "expired") return { ...preflight, issue };
 
   try {
+    await Promise.race([preflight.launchResult, deadline.expiration]);
     const plan = await Promise.race([
       startIssuePlanTurn(client, { workspace, issue, deadline }),
       deadline.expiration,

@@ -52,7 +52,7 @@ function requireFailureSignal(client) {
   return client.failure;
 }
 
-test("spawns a job-owned app-server with process-scoped MCP overrides", () => {
+test("spawns a job-owned app-server without inventing MCP entries", () => {
   const spawnCodexAppServer = requireAppServerFactory();
   const fake = fakeSpawner();
   const existingCodexHome = process.env.CODEX_HOME;
@@ -69,10 +69,6 @@ test("spawns a job-owned app-server with process-scoped MCP overrides", () => {
         "apps",
         "--disable",
         "plugins",
-        "-c",
-        "mcp_servers.computer-use.enabled=false",
-        "-c",
-        "mcp_servers.node_repl.enabled=false",
       ],
       options: { cwd: workspace, stdio: ["pipe", "pipe", "inherit"] },
     },
@@ -80,6 +76,78 @@ test("spawns a job-owned app-server with process-scoped MCP overrides", () => {
   assert.equal(process.env.CODEX_HOME, existingCodexHome);
   assert.equal(fake.children[0].stdinWrites.length, 0);
   client.close();
+});
+
+test("disables only discovered MCP names with literal inline-table keys", () => {
+  const fake = fakeSpawner();
+  const client = requireAppServerFactory()({
+    workspace, spawnProcess: fake.spawnProcess,
+    mcpServerNames: ["computer-use", "name.with.dot", 'quoted"name'],
+  });
+  assert.deepEqual(fake.calls[0].args.slice(6), [
+    "-c",
+    'mcp_servers={"computer-use"={enabled=false},"name.with.dot"={enabled=false},"quoted\\"name"={enabled=false}}',
+  ]);
+  client.close();
+});
+
+test("discovers configured MCP entries without exposing their settings", async () => {
+  assert.equal(typeof issueFlow.createCodexAppServer, "function");
+  for (const names of [[], ["computer-use", "node_repl"]]) {
+    const fake = fakeSpawner();
+    const signal = new AbortController().signal;
+    const client = await issueFlow.createCodexAppServer({
+      workspace, signal, spawnProcess: fake.spawnProcess,
+      executeFile: async (command, args, options) => {
+        assert.equal(command, "codex");
+        assert.deepEqual(args, ["--disable", "apps", "--disable", "plugins", "mcp", "list", "--json"]);
+        assert.equal(options.cwd, workspace);
+        assert.equal(options.signal, signal);
+        assert.equal(options.timeout, 10000);
+        assert.equal(options.maxBuffer, 1024 * 1024);
+        return { stdout: JSON.stringify(names.map(name => ({ name, enabled: true, secret: "private-setting" }))) };
+      },
+    });
+    assert.equal(fake.calls.length, 1);
+    const overrides = fake.calls[0].args.slice(6);
+    assert.deepEqual(overrides, names.length ? ["-c", 'mcp_servers={"computer-use"={enabled=false},"node_repl"={enabled=false}}'] : []);
+    assert.equal(JSON.stringify(fake.calls).includes("private-setting"), false);
+    client.close();
+  }
+});
+
+test("fails closed without spawning on invalid or failed MCP discovery", async () => {
+  assert.equal(typeof issueFlow.createCodexAppServer, "function");
+  for (const value of ["invalid-json", "{}", '[{"name":""}]', '[{"enabled":true}]', new Error("private-setting")]) {
+    const fake = fakeSpawner();
+    await assert.rejects(issueFlow.createCodexAppServer({
+      workspace, spawnProcess: fake.spawnProcess,
+      executeFile: async () => {
+        if (value instanceof Error) throw value;
+        return { stdout: value };
+      },
+    }), error => {
+      assert.match(error.message, /MCP configuration/);
+      assert.equal(error.message.includes("private-setting"), false);
+      return true;
+    });
+    assert.equal(fake.calls.length, 0);
+  }
+});
+
+test("does not spawn after MCP discovery finishes past cancellation", async () => {
+  assert.equal(typeof issueFlow.createCodexAppServer, "function");
+  const fake = fakeSpawner();
+  const controller = new AbortController();
+  const reason = new Error("Issue expired");
+  await assert.rejects(issueFlow.createCodexAppServer({
+    workspace, signal: controller.signal, spawnProcess: fake.spawnProcess,
+    executeFile: async () => {
+      controller.abort(reason);
+      return { stdout: "[]" };
+    },
+  }), error => error === reason);
+  assert.equal(fake.calls.length, 0);
 });
 
 test("correlates out-of-order JSONL responses and preserves interleaved events", async () => {
