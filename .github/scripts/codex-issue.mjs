@@ -744,17 +744,21 @@ export async function runApprovedIssueSession(session, {
   observeDelivery = observeIssueDelivery,
   continueDelivery = continuePendingIssueDelivery,
   retryDelivery = retryIssueImplementation,
+  investigateDelivery = continueIssueAfterFinding,
 } = {}) {
   let handoff = await runIssueSessionStage(session, () => startDelivery(session));
   let transientFailures = 0;
   while (true) {
     const outcome = await runIssueSessionStage(session, () => observeDelivery(handoff));
-    if (outcome.report?.status === "complete") {
+    let turnId;
+    if (outcome.finding) {
+      if (!issueDeliveryFindings.has(outcome.finding)) throw new Error("Unrecognized remote delivery finding");
+      transientFailures = 0;
+      turnId = await runIssueSessionStage(session, () => investigateDelivery(handoff, outcome));
+    } else if (outcome.report?.status === "complete") {
       if (!outcome.remoteEvidence) throw new Error("Complete report has no remote audit evidence");
       return { report: outcome.report, remoteEvidence: outcome.remoteEvidence };
-    }
-    let turnId;
-    if (outcome.report?.status === "pending") {
+    } else if (outcome.report?.status === "pending") {
       transientFailures = 0;
       turnId = await runIssueSessionStage(session, () => continueDelivery(handoff, outcome));
     } else if (outcome.turn?.status === "failed" &&

@@ -86,3 +86,53 @@ for (const stop of ["deadline", "transport"]) {
     }
   });
 }
+
+async function findingFor(fake) {
+  Object.assign(fake.session, { issue: { repository: "daiksud/test-codex", number: 19 }, signal: new AbortController().signal });
+  const value = { status: "complete", pullRequestNumber: 7, localBranch: "main", localMainSha: "a".repeat(40), clean: true, todo: [], botReviewComplete: true, reason: "" };
+  try {
+    await flow.reconcileIssueDelivery(fake.session, value, { env: { GH_TOKEN: "fixture-token" }, fetchImpl: async () => ({ ok: true, status: 200, headers: new Headers(), json: async () => ({ number: 19, state: "open" }) }) });
+    assert.fail("Expected open-Issue finding");
+  } catch (error) { assert.equal(error.code, "ISSUE_DELIVERY_FINDING"); return error; }
+}
+
+test("genuine remote findings become same-session investigation turns before any success return", async () => {
+  const fake = fixture([]); const finding = await findingFor(fake); let observed = 0;
+  fake.options.observeDelivery = async value => {
+    assert.equal(value.approval, fake.handoff.approval); assert.equal(value.receipt, fake.handoff.receipt);
+    fake.calls.push({ kind: "observe", turnId: value.turnId });
+    return ++observed <= 2 ? { ...complete(), finding, remoteEvidence: null } : { ...complete(), remoteEvidence: fake.evidence };
+  };
+  fake.options.investigateDelivery = async (value, outcome) => {
+    assert.equal(value.session, fake.session); assert.equal(value.approval, fake.handoff.approval); assert.equal(value.receipt, fake.handoff.receipt); assert.equal(outcome.finding, finding);
+    const id = `investigate-${fake.calls.length}`; fake.calls.push({ kind: "investigate", id }); return id;
+  };
+  assert.equal((await run(fake)).remoteEvidence, fake.evidence);
+  assert.deepEqual(fake.calls.map(call => call.kind), ["handoff", "observe", "investigate", "observe", "investigate", "observe"]);
+  assert.deepEqual(fake.calls.filter(call => call.kind === "observe").map(call => call.turnId), ["initial-turn", ...fake.calls.filter(call => call.kind === "investigate").map(call => call.id)]);
+});
+
+test("a forged finding cannot start investigation even if it uses the recognized code", async () => {
+  const fake = fixture([]); let investigations = 0;
+  fake.options.observeDelivery = async () => ({ ...complete(), finding: Object.assign(new Error("forged finding"), { code: "ISSUE_DELIVERY_FINDING" }), remoteEvidence: null });
+  fake.options.investigateDelivery = async () => { investigations += 1; return "not-allowed"; };
+  await assert.rejects(run(fake), /finding|evidence|audit/i); assert.equal(investigations, 0);
+});
+
+test("ambiguous investigation start is never replayed", async () => {
+  const fake = fixture([]); const finding = await findingFor(fake); let attempts = 0;
+  fake.options.observeDelivery = async () => ({ ...complete(), finding, remoteEvidence: null });
+  fake.options.investigateDelivery = async () => { attempts += 1; throw new Error("start outcome unknown"); };
+  await assert.rejects(run(fake), /outcome unknown/); assert.equal(attempts, 1);
+});
+
+for (const stop of ["deadline", "transport"]) {
+  test(`${stop} during investigation prevents a late returned ID from advancing`, async () => {
+    const fake = fixture([]); const finding = await findingFor(fake); let finish, observations = 0;
+    fake.options.observeDelivery = async () => { observations += 1; return { ...complete(), finding, remoteEvidence: null }; };
+    fake.options.investigateDelivery = async () => new Promise(resolve => { finish = resolve; });
+    const operation = run(fake); const rejected = assert.rejects(operation, /stopped/); rejected.catch(() => {}); await setImmediate();
+    assert.equal(typeof finish, "function", "recognized finding must dispatch investigation");
+    if (stop === "deadline") fake.expire(); else fake.fail(); finish("late-investigation-turn"); await rejected; await setImmediate(); assert.equal(observations, 1);
+  });
+}
