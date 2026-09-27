@@ -343,3 +343,57 @@ test("a marker created after merge cannot displace earlier valid pre-merge evide
   assert.deepEqual(await audit(fake, { ...facts, mergedAt: mergeTime }), { headSha, bots: [bot.login] });
   assert.equal(fake.calls.some(call => call.url.includes("/issues/comments/43/reactions?")), false);
 });
+
+const noFindingsComment = {
+  id: 44, html_url: `https://github.com/${repository}/pull/7#issuecomment-44`,
+  user: { type: "Bot", login: "chatgpt-codex-connector[bot]" },
+  body: `Codex Review: Didn't find any major issues. Nice work!\n\n**Reviewed commit:** \`${headSha.slice(0,10)}\``,
+  created_at: "2026-09-27T00:00:03Z", updated_at: "2026-09-27T00:00:03Z",
+};
+function noFindingsFixture() {
+  const fake = thumbFixture(); fake.reactions["42:1"] = [];
+  fake.reviewComments[0].push({ ...noFindingsComment });
+  return fake;
+}
+
+test("the observed no-findings CodeBot comment can complete a GHA-requested review", async () => {
+  const fake = noFindingsFixture();
+  assert.deepEqual(await audit(fake, { ...facts, mergedAt: mergeTime }), { headSha, bots: [bot.login] });
+  const equality = noFindingsFixture(); equality.reviewComments[0][1].created_at = mergeTime; equality.reviewComments[0][1].updated_at = mergeTime;
+  assert.deepEqual(await audit(equality, { ...facts, mergedAt: mergeTime }), { headSha, bots: [bot.login] });
+});
+
+test("no-findings comments require the configured actor, reviewed head and prior GHA request", async () => {
+  for (const mode of ["human", "otherBot", "head", "body", "taskReply", "noRequest", "humanRequest", "beforeRequest", "badURL", "badDate"]) {
+    const fake = noFindingsFixture(), response = fake.reviewComments[0][1];
+    if (mode === "human") response.user = { type: "User", login: human.login };
+    if (mode === "otherBot") response.user = { type: "Bot", login: "second-review[bot]" };
+    if (mode === "head") response.body = response.body.replace(headSha.slice(0,10), "c".repeat(10));
+    if (mode === "body") response.body = `Codex Review: There are findings.\n\n**Reviewed commit:** \`${headSha.slice(0,10)}\``;
+    if (mode === "taskReply") response.body = "To use Codex here, create an environment for this repo.";
+    if (mode === "noRequest") fake.reviewComments[0].shift();
+    if (mode === "humanRequest") fake.reviewComments[0][0].user = { login: human.login };
+    if (mode === "beforeRequest") response.created_at = "2026-09-26T23:59:59Z";
+    if (mode === "badURL") response.html_url = "https://example.test/wrong";
+    if (mode === "badDate") response.updated_at = "not a timestamp";
+    await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), /Bot|review|comment|timestamp/i);
+  }
+});
+
+test("a no-findings comment published or edited only after merge cannot establish completion", async () => {
+  for (const mode of ["published", "edited"]) {
+    const fake = noFindingsFixture(), response = fake.reviewComments[0][1];
+    response.updated_at = "2026-09-27T00:00:06Z";
+    if (mode === "published") response.created_at = response.updated_at;
+    await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), error => error.code !== "ISSUE_DELIVERY_FINDING" && /merge|order/i.test(error.message));
+  }
+});
+
+test("current-head negative review and unresolved threads still override a no-findings comment", async () => {
+  for (const state of ["CHANGES_REQUESTED", "PENDING", "DISMISSED"]) {
+    const fake = noFindingsFixture(); fake.reviews[0] = [{ ...review, state }];
+    await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), /Bot|review/i);
+  }
+  const unresolved = noFindingsFixture(); unresolved.threads.first = connection([thread(bot, false)]);
+  await assert.rejects(audit(unresolved, { ...facts, mergedAt: mergeTime }), /Bot|thread/i);
+});

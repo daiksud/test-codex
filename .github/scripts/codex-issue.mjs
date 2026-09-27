@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 export const MAX_ISSUE_RUNTIME_MS = 24 * 60 * 60 * 1000;
 const ISSUE_REVIEW_BOT = "chatgpt-codex-connector";
 const ISSUE_AUTOMATION_BOT = "github-actions";
+const CODEX_REVIEWED_COMMIT_PATTERN = /\*\*Reviewed commit:\*\*\s*`([a-f0-9]{7,40})`/i;
 const ISSUE_BOT_REVIEW_INSTRUCTIONS = `For this repository's configured ${ISSUE_REVIEW_BOT}, request review on every new PR head before merge unless a completed current-head review already exists. Replace FULL_PR_HEAD_SHA with the actual 40-character PR head and use exactly this comment body:
 @codex review
 
@@ -1320,7 +1321,7 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
         if (login === ISSUE_AUTOMATION_BOT) continue;
         if (login === ISSUE_REVIEW_BOT && review.state === "COMMENTED") {
           const reviewedCommit = typeof review.body === "string" &&
-            review.body.match(/\*\*Reviewed commit:\*\*\s*`([a-f0-9]{7,40})`/i)?.[1];
+            review.body.match(CODEX_REVIEWED_COMMIT_PATTERN)?.[1];
           if (!reviewedCommit || !review.body.includes("Codex Review") ||
               !review.commit_id.toLowerCase().startsWith(reviewedCommit.toLowerCase())) continue;
         }
@@ -1362,17 +1363,23 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
       await inspectComments(thread);
     }
   } while (cursor !== null);
-  let connectorReactionComplete = false;
+  let connectorRequestComplete = false;
   let postMergeEvidence = false;
   const connectorReview = latestReviews.get(ISSUE_REVIEW_BOT);
   if (!connectorReview || connectorReview.commit_id !== facts.headSha) {
     const marker = `<!-- codex-issue-review:${facts.headSha} -->`;
     let newestRequest = null;
+    const noFindingsComments = [];
     for (let index = 1; ; index += 1) {
       const comments = await read(`https://api.github.com/repos/${issue.repository}/issues/${number}/comments?per_page=100&page=${index}`);
       if (!Array.isArray(comments)) throw new Error("Invalid Bot review request comments");
       for (const comment of comments) {
         const lines = typeof comment?.body === "string" ? comment.body.split(/\r?\n/) : [];
+        if (comment.user?.type === "Bot" && botLogin(comment.user.login) === ISSUE_REVIEW_BOT &&
+            lines[0] === "Codex Review: Didn't find any major issues. Nice work!") {
+          const reviewedCommit = comment.body.match(CODEX_REVIEWED_COMMIT_PATTERN)?.[1];
+          if (reviewedCommit && facts.headSha.toLowerCase().startsWith(reviewedCommit.toLowerCase())) noFindingsComments.push(comment);
+        }
         if (lines[0] !== "@codex review" || !lines.includes(marker) ||
             comment.user?.login !== "github-actions[bot]") continue;
         const createdAt = typeof comment.created_at === "string" ? Date.parse(comment.created_at) : NaN;
@@ -1394,6 +1401,18 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
       if (comments.length < 100) break;
     }
     if (newestRequest) {
+      for (const comment of noFindingsComments) {
+        const createdAt = typeof comment.created_at === "string" ? Date.parse(comment.created_at) : NaN;
+        const updatedAt = typeof comment.updated_at === "string" ? Date.parse(comment.updated_at) : NaN;
+        if (!Number.isSafeInteger(comment.id) || comment.id <= 0 ||
+            comment.html_url !== `https://github.com/${issue.repository}/pull/${number}#issuecomment-${comment.id}` ||
+            !Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || updatedAt < createdAt) {
+          throw new Error("Invalid Bot no-findings review comment identity or timestamp");
+        }
+        if (createdAt < newestRequest.updatedAt) continue;
+        if (mergedAt !== null && updatedAt > mergedAt) postMergeEvidence = true;
+        else connectorRequestComplete = true;
+      }
       for (let index = 1; ; index += 1) {
         const reactions = await read(`https://api.github.com/repos/${issue.repository}/issues/comments/${newestRequest.comment.id}/reactions?per_page=100&page=${index}`);
         if (!Array.isArray(reactions)) throw new Error("Invalid Bot review reactions");
@@ -1403,16 +1422,16 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
           const createdAt = typeof reaction.created_at === "string" ? Date.parse(reaction.created_at) : NaN;
           if (Number.isFinite(createdAt) && createdAt >= newestRequest.updatedAt) {
             if (mergedAt !== null && createdAt > mergedAt) postMergeEvidence = true;
-            else connectorReactionComplete = true;
+            else connectorRequestComplete = true;
           }
         }
         if (reactions.length < 100) break;
       }
     }
   }
-  if (!connectorReactionComplete && postMergeEvidence) throw new Error("Bot review request or reaction occurred after PR merge");
+  if (!connectorRequestComplete && postMergeEvidence) throw new Error("Bot review request or reaction occurred after PR merge");
   for (const login of participants) {
-    if (login === ISSUE_REVIEW_BOT && connectorReactionComplete) continue;
+    if (login === ISSUE_REVIEW_BOT && connectorRequestComplete) continue;
     const review = latestReviews.get(login);
     if (!review || review.commit_id !== facts.headSha || !["COMMENTED", "APPROVED"].includes(review.state) ||
         typeof review.submitted_at !== "string" || !Number.isFinite(Date.parse(review.submitted_at))) {
