@@ -735,6 +735,37 @@ if (directScriptPath === fileURLToPath(import.meta.url)) {
   void runIssuePlanCli();
 }
 
+export async function readIssueImplementationTurn(session, turnId) {
+  const { client, deadline, threadId } = session;
+  let finalAnswer = null;
+  let unlabeledAnswer = null;
+  let error = null;
+  while (true) {
+    if (deadline.expired) throw deadline.error;
+    const event = await Promise.race([
+      deadline.expiration, client.failure, client.nextEvent(),
+    ]);
+    if (deadline.expired) throw deadline.error;
+    const params = event?.params ?? {};
+    if (params.threadId !== threadId) continue;
+    if (params.turnId === turnId) {
+      if (event.method === "error") error = params.error;
+      if (event.method === "item/completed" && params.item?.type === "agentMessage" &&
+          typeof params.item.text === "string") {
+        if (params.item.phase === "final_answer") finalAnswer = params.item.text;
+        else if (params.item.phase == null) unlabeledAnswer = params.item.text;
+      }
+    }
+    if (event.method === "turn/completed" && params.turn?.id === turnId) {
+      return {
+        status: params.turn.status,
+        text: finalAnswer ?? unlabeledAnswer,
+        error: params.turn.status === "failed" ? params.turn.error ?? error : null,
+      };
+    }
+  }
+}
+
 async function listAll(client, method, params) {
   const results = [];
   let cursor = null;
