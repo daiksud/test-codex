@@ -167,3 +167,16 @@ test("ambiguous or missing-ID continuation startup leaves no trusted active turn
     assert.equal(fake.session.deliveryContext.turnId, null);
   }
 });
+
+
+test("resume tells Codex to recognize the observed no-findings comment without waiting for another review form", async () => {
+  const assertInstruction = prompt => {
+    assert.ok(prompt.includes("Codex Review: Didn't find any major issues. Nice work!"));
+    assert.match(prompt, /Reviewed commit.*current.*head/is);
+    assert.match(prompt, /no-findings.*github-actions\[bot\].*request/is);
+    assert.match(prompt, /review.*(?:before|no later than).*merge/is);
+  };
+  const fake = fixture();
+  await resume(fake);
+  assertInstruction(fake.requests.find(call => call.method === "turn/start").params.input[0].text);
+});

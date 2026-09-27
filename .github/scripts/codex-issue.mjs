@@ -13,7 +13,7 @@ const ISSUE_BOT_REVIEW_INSTRUCTIONS = `For this repository's configured ${ISSUE_
 @codex review
 
 <!-- codex-issue-review:FULL_PR_HEAD_SHA -->
-Inspect existing comments for the exact head marker and reuse a matching request before retrying an uncertain comment POST; do not duplicate it. Wait for a submitted current-head review or the connector's +1 reaction on that request, resolve all valid findings, and do not request human review.`;
+Inspect existing comments for the exact head marker and reuse a matching request before retrying an uncertain comment POST; do not duplicate it. Wait for a submitted current-head review or the connector's +1 reaction on that request. The connector's no-findings PR comment starting exactly with "Codex Review: Didn't find any major issues. Nice work!" and carrying a Reviewed commit marker matching the current PR head is also a completion path when it follows the matching github-actions[bot]-authored request. All review completion evidence must be no later than PR merge; the controller validates comment identity, URL and timestamps. Resolve all valid findings and do not request human review.`;
 const DELIVERY_REPORT_SCHEMA = {
   type: "object", additionalProperties: false,
   properties: {
