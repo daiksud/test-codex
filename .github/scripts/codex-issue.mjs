@@ -1190,6 +1190,9 @@ export async function verifyIssueRequiredCi(session, facts, options = {}) {
       !/^[a-f0-9]{40}$/i.test(facts.headSha ?? "")) {
     throw new Error("CI facts must match this Issue and a valid PR head");
   }
+  const mergedAt = facts.mergedAt === undefined ? null :
+    typeof facts.mergedAt === "string" ? Date.parse(facts.mergedAt) : NaN;
+  if (mergedAt !== null && !Number.isFinite(mergedAt)) throw new Error("Invalid CI merge cutoff timestamp");
   const get = createIssueGitHubReader(session, options);
   const root = `https://api.github.com/repos/${issue.repository}`;
   const rules = await get(`${root}/rules/branches/main`);
@@ -1226,6 +1229,11 @@ export async function verifyIssueRequiredCi(session, facts, options = {}) {
       throw issueDeliveryFinding("Required CI status has no matching Actions run provenance");
     }
     if (latestStatus.state !== "success") throw issueDeliveryFinding("Required CI status is not successful on the exact PR head");
+    if (mergedAt !== null) {
+      const createdAt = typeof latestStatus.created_at === "string" ? Date.parse(latestStatus.created_at) : NaN;
+      if (!Number.isFinite(createdAt)) throw new Error("Invalid CI status creation timestamp");
+      if (createdAt > mergedAt) throw new Error("CI success status was created after PR merge");
+    }
   }
   let hasCheck = false;
   for (let page = 1; ; page += 1) {
@@ -1249,6 +1257,11 @@ export async function verifyIssueRequiredCi(session, facts, options = {}) {
       }
       if (check.status !== "completed" || !["success", "skipped", "neutral"].includes(check.conclusion)) {
         throw issueDeliveryFinding("Required CI check is not successful on the exact PR head");
+      }
+      if (mergedAt !== null) {
+        const completedAt = typeof check.completed_at === "string" ? Date.parse(check.completed_at) : NaN;
+        if (!Number.isFinite(completedAt)) throw new Error("Invalid CI check completion timestamp");
+        if (completedAt > mergedAt) throw new Error("CI check completed after PR merge");
       }
     }
     if (response.check_runs.length < 100) break;

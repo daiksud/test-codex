@@ -10,8 +10,8 @@ const headSha = "b".repeat(40);
 const facts = { repository, issueNumber: 19, pullRequestNumber: 7, headSha, mainSha: "a".repeat(40) };
 const context = "Codex verification";
 const actionsRunUrl = `https://github.com/${repository}/actions/runs/9001`;
-const status = { context, state: "success", url: root + `/statuses/${headSha}`, target_url: actionsRunUrl, creator: { login: "github-actions[bot]" } };
-const check = { name: context, head_sha: headSha, status: "completed", conclusion: "success", app: { slug: "github-actions" }, details_url: `https://github.com/${repository}/actions/runs/9002/job/8001` };
+const status = { context, state: "success", created_at: "2026-09-27T00:00:03Z", url: root + `/statuses/${headSha}`, target_url: actionsRunUrl, creator: { login: "github-actions[bot]" } };
+const check = { completed_at: "2026-09-27T00:00:03Z", name: context, head_sha: headSha, status: "completed", conclusion: "success", app: { slug: "github-actions" }, details_url: `https://github.com/${repository}/actions/runs/9002/job/8001` };
 function fixture() {
   const controller = new AbortController();
   const deadline = { expired: false, expiration: new Promise(() => {}) };
@@ -180,3 +180,62 @@ for (const stop of ["deadline", "transport"]) {
     assert.equal(signal.aborted, true);
   });
 }
+
+
+const mergeTime = "2026-09-27T00:00:05Z";
+
+test("status-only, check-only and mixed CI evidence can complete no later than merge", async () => {
+  for (const mode of ["status", "check", "both"]) {
+    for (const time of ["2026-09-27T00:00:03Z", mergeTime]) {
+      const fake = fixture();
+      statuses(fake, mode === "check" ? [] : [{ ...status, created_at: time }]);
+      checks(fake, mode === "status" ? [] : [{ ...check, completed_at: time }]);
+      if (mode === "check") delete fake.session.actionsRunUrl;
+      assert.deepEqual(await audit(fake, { ...facts, mergedAt: mergeTime }), { headSha, requiredContext: context });
+    }
+  }
+});
+
+test("a correctly bound status first published after merge cannot retroactively establish CI", async () => {
+  const fake = fixture();
+  statuses(fake, [{ ...status, created_at: "2026-09-27T00:00:06Z" }, status]);
+  checks(fake, [check]);
+  await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), error => error.code !== "ISSUE_DELIVERY_FINDING" && /merge|order/i.test(error.message));
+});
+
+test("late check completion cannot replace check-only or mixed pre-merge verification", async () => {
+  for (const mode of ["check", "both"]) {
+    const fake = fixture();
+    if (mode === "check") { statuses(fake, []); delete fake.session.actionsRunUrl; }
+    checks(fake, [{ ...check, completed_at: "2026-09-27T00:00:06Z" }]);
+    await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), error => error.code !== "ISSUE_DELIVERY_FINDING" && /merge|order/i.test(error.message));
+  }
+});
+
+test("post-merge CI auditing fails closed on missing or invalid status/check timestamps", async () => {
+  for (const mode of ["status", "check"]) {
+    for (const time of [undefined, null, "not a timestamp", 178]) {
+      const fake = fixture();
+      if (mode === "status") statuses(fake, [{ ...status, created_at: time }]);
+      else { statuses(fake, []); delete fake.session.actionsRunUrl; checks(fake, [{ ...check, completed_at: time }]); }
+      await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), error => error.code !== "ISSUE_DELIVERY_FINDING" && /timestamp|CI/i.test(error.message));
+    }
+  }
+});
+
+test("invalid supplied CI merge cutoffs fail before any API read", async () => {
+  for (const mergedAt of [null, "", "not a timestamp", 178]) {
+    const fake = fixture();
+    await assert.rejects(audit(fake, { ...facts, mergedAt }), /merge|cutoff|timestamp/i);
+    assert.equal(fake.calls.length, 0);
+  }
+});
+
+test("pending or failing CI retains its existing finding classification with a merge cutoff", async () => {
+  for (const mode of ["status", "check"]) {
+    const fake = fixture();
+    if (mode === "status") statuses(fake, [{ ...status, state: "pending", created_at: undefined }]);
+    else checks(fake, [{ ...check, status: "in_progress", conclusion: null, completed_at: null }]);
+    await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), error => error.code === "ISSUE_DELIVERY_FINDING");
+  }
+});
