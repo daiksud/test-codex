@@ -146,3 +146,53 @@ test("does not consume queued approval after the deadline already expired", asyn
   await assert.rejects(waitForApproval(fake.session), /deadline expired/);
   assert.equal(fake.requests.length, 0);
 });
+
+function finishBeforeInterrupt(fake, error = Object.assign(new Error("no active turn to interrupt"), { code: -32600 })) {
+  const original = fake.session.client.request;
+  fake.session.client.request = async (...args) => { await original(...args); throw error; };
+}
+
+for (const status of ["completed", "interrupted"]) {
+  test(`approval finishing ${status} before interrupt still requires and accepts its terminal event`, async () => {
+    const fake = fixture([message(prefix + "Exact approved Plan"), completed(approvalTurnId, status)]);
+    finishBeforeInterrupt(fake);
+    assert.deepEqual(await waitForApproval(fake.session), { approvedPlan: "Exact approved Plan", approvalTurnId });
+    assert.equal(fake.requests.length, 1);
+  });
+}
+
+test("no-active interruption races cannot accept failed or file-changing approval turns", async () => {
+  for (const ending of [completed(approvalTurnId, "failed"), { method: "item/completed", params: { threadId, turnId: approvalTurnId, item: { type: "fileChange" } } }]) {
+    const fake = fixture([message(prefix + "Plan"), ending]); finishBeforeInterrupt(fake);
+    await assert.rejects(waitForApproval(fake.session), /status|modify files/);
+    assert.equal(fake.requests.length, 1);
+  }
+});
+
+test("other interrupt RPC errors are not mistaken for natural completion", async () => {
+  for (const error of [
+    Object.assign(new Error("expected active turn id approval but found other"), { code: -32600 }),
+    Object.assign(new Error("no active turn to interrupt"), { code: -32601 }),
+    new Error("no active turn to interrupt"),
+  ]) {
+    const fake = fixture([message(prefix + "Plan"), completed(approvalTurnId, "completed")]); finishBeforeInterrupt(fake, error);
+    await assert.rejects(waitForApproval(fake.session), value => value === error);
+    assert.equal(fake.requests.length, 1);
+  }
+});
+
+for (const stop of ["matched-terminal", "deadline", "transport"]) {
+  test(`natural completion race still waits for ${stop} without accepting a mismatched terminal`, async () => {
+    const fake = fixture([message(prefix + "Plan"), completed("other-turn", "completed")], false, true); finishBeforeInterrupt(fake);
+    let released = false;
+    const waiting = waitForApproval(fake.session).then(value => { released = true; return value; }); waiting.catch(() => {});
+    await setImmediate();
+    assert.equal(released, false); assert.equal(fake.requests.length, 1);
+    if (stop === "matched-terminal") { fake.emit(completed(approvalTurnId, "completed")); assert.equal((await waiting).approvalTurnId, approvalTurnId); }
+    else {
+      const rejected = assert.rejects(waiting, /deadline expired|transport lost/);
+      if (stop === "deadline") fake.expire(); else fake.fail(new Error("transport lost"));
+      await rejected;
+    }
+  });
+}

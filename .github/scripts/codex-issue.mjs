@@ -601,9 +601,14 @@ export async function waitForIssuePlanApproval(session) {
       throw new Error("Approval message has no turn ID");
     }
     approval = { approvedPlan, approvalTurnId: params.turnId };
-    await bounded(() => client.request("turn/interrupt", {
-      threadId, turnId: approval.approvalTurnId,
-    }));
+    try {
+      await bounded(() => client.request("turn/interrupt", {
+        threadId, turnId: approval.approvalTurnId,
+      }));
+    } catch (error) {
+      if (error.code !== -32600 || error.message !== "no active turn to interrupt") throw error;
+      // The read-only UI turn may already have finished; its terminal event is still required.
+    }
   }
 }
 
