@@ -172,3 +172,80 @@ for (const stop of ["deadline", "transport"]) {
     }
   });
 }
+
+test("CLI records failure before approved cleanup and closes the client only afterward", async () => {
+  const fake = fixture();
+  fake.session.deliveryContext = { approval: {}, receipt: {}, turnId: "owned-turn" };
+  const order = [];
+  fake.options.executeDelivery = async () => { throw new Error("original failure"); };
+  fake.options.cleanupSession = async (session, reason) => {
+    assert.equal(session, fake.session);
+    assert.equal(reason, "original failure");
+    assert.equal(fake.exitCode, 1);
+    assert.match(fake.stderr, /original failure/);
+    assert.equal(fake.closeCount, 0);
+    order.push("cleanup");
+    return { status: "failed", cleanupReport: { localBranch: "main", clean: true } };
+  };
+  await runIssuePlanCli(fake.options);
+  assert.deepEqual(order, ["cleanup"]);
+  assert.equal(fake.exitCode, 1);
+  assert.equal(fake.closeCount, 1);
+  assert.equal(fake.cancelCount, 1);
+  assert.match(fake.stdout, /cleanup.*(?:reports|reported)/i);
+  assert.doesNotMatch(fake.stdout, /remote.*conditions.*checked/i);
+});
+
+test("cleanup failure does not replace the original delivery failure or prevent close", async () => {
+  const fake = fixture();
+  fake.session.deliveryContext = { approval: {}, receipt: {}, turnId: "owned-turn" };
+  let attempts = 0;
+  fake.options.executeDelivery = async () => { throw new Error("original failure"); };
+  fake.options.cleanupSession = async () => {
+    attempts += 1;
+    throw new Error("cleanup unavailable");
+  };
+  await runIssuePlanCli(fake.options);
+  assert.equal(attempts, 1);
+  assert.equal(fake.exitCode, 1);
+  assert.match(fake.stderr, /original failure/);
+  assert.match(fake.stderr, /cleanup unavailable/);
+  assert.equal(fake.closeCount, 1);
+});
+
+test("successful delivery, missing approval, expired session or lost transport cannot invoke failure cleanup", async () => {
+  for (const mode of ["success", "unapproved", "expired", "transport"]) {
+    const fake = fixture();
+    if (mode !== "unapproved") fake.session.deliveryContext = { approval: {}, receipt: {}, turnId: "owned-turn" };
+    let attempts = 0;
+    fake.options.cleanupSession = async () => { attempts += 1; };
+    fake.options.executeDelivery = async () => {
+      if (mode === "success") return result;
+      if (mode === "expired") fake.expire();
+      if (mode === "transport") fake.fail();
+      throw new Error("original failure");
+    };
+    await runIssuePlanCli(fake.options);
+    assert.equal(attempts, 0);
+    assert.equal(fake.closeCount, 1);
+  }
+});
+
+test("cleanup reaching the hard deadline records timeout while preserving the original failure", async () => {
+  const fake = fixture();
+  fake.session.deliveryContext = { approval: {}, receipt: {}, turnId: "owned-turn" };
+  const comments = [];
+  fake.options.executeDelivery = async () => { throw new Error("original failure"); };
+  fake.options.cleanupSession = async () => {
+    fake.expire();
+    throw fake.session.deadline.error;
+  };
+  fake.options.commentIssue = async (issue, reason) => { comments.push({ issue, reason }); };
+  await runIssuePlanCli(fake.options);
+  assert.equal(fake.exitCode, 1);
+  assert.match(fake.stderr, /original failure/);
+  assert.equal(comments.length, 1);
+  assert.equal(comments[0].issue, fake.session.issue);
+  assert.equal(comments[0].reason, "deadline expired");
+  assert.equal(fake.closeCount, 1);
+});

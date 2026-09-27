@@ -471,6 +471,7 @@ export async function postIssueFailureComment(
 export async function runIssuePlanCli({
   startJob = runIssuePlanJob,
   executeDelivery = runApprovedIssueSession,
+  cleanupSession = runIssueFailureCleanup,
   commentIssue = postIssueFailureComment,
   writeStdout = (text) => process.stdout.write(text),
   writeStderr = (text) => process.stderr.write(text),
@@ -501,11 +502,34 @@ export async function runIssuePlanCli({
   } catch (error) {
     setExitCode(1);
     writeStderr(`Codex Issue session failed: ${error.message}\n`);
-    closeOwnedSession();
-    const issue = error.issue ?? session?.issue;
-    if (error.code === "ISSUE_DEADLINE_EXCEEDED" && issue) {
+    let deadlineFailure = error.code === "ISSUE_DEADLINE_EXCEEDED" ? error : null;
+    if (session?.deliveryContext && !session.deadline.expired) {
+      let usable = false;
       try {
-        await commentIssue(issue, error.message);
+        await Promise.race([session.deadline.expiration, session.client.failure, Promise.resolve()]);
+        usable = !session.deadline.expired;
+      } catch {
+        // A lost client or exhausted deadline cannot run a cleanup turn.
+      }
+      if (usable) {
+        try {
+          const cleanup = await runIssueSessionStage(session, () => cleanupSession(session, error.message));
+          if (cleanup?.status !== "failed" || !cleanup.cleanupReport) throw new Error("Invalid failure cleanup report");
+          writeStdout("Failure cleanup reports synchronized, clean local main; the original delivery remains failed.\n");
+        } catch (cleanupError) {
+          writeStderr(`Failure cleanup could not complete: ${cleanupError.message}\n`);
+          if (cleanupError.code === "ISSUE_DEADLINE_EXCEEDED") deadlineFailure = cleanupError;
+        }
+      }
+    }
+    if (session?.deadline.expired && session.deadline.error?.code === "ISSUE_DEADLINE_EXCEEDED") {
+      deadlineFailure = session.deadline.error;
+    }
+    closeOwnedSession();
+    const issue = deadlineFailure?.issue ?? error.issue ?? session?.issue;
+    if (deadlineFailure && issue) {
+      try {
+        await commentIssue(issue, deadlineFailure.message);
       } catch (commentError) {
         writeStderr(
           `Issue failure comment could not be posted: ${commentError.message}\n`,
