@@ -67,12 +67,14 @@ Codex の完了報告だけで成功にせず、Plan コメント、Issue、merg
 そのため Codex は毎回の正確な PR head で repository checks を実行し、Actions run URL 付きの
 `Codex verification` commit status を pending → success に更新する。
 status の作成者が `github-actions[bot]`、`target_url` が session に保持した今回の Actions run URL と一致することも確認する。
+この Issue job では、その status が必須。Actions context のない読み取り確認では、同じ head の GitHub Actions app と同じ repository の run/job URL がある check-run を検証できる。
 人間の追加 workflow 承認は要求しない。`GH_TOKEN` は job の write token で、
 `github-actions[bot]` としての書き込みはこの処理で意図したもの。
 
 この repository で確認した Codex review integration の `chatgpt-codex-connector` の証拠を controller の完了条件にする。
 現在の head の review が未完了なら `@codex review` と head SHA の marker を PR コメントに書き、同じ marker の既存 request は再利用する。
 submitted かつ現在の head の `COMMENTED` / `APPROVED` formal review、またはその request に付いた connector の新しい 👍 を完了の証拠にする。[^github-review]
+`COMMENTED` は、実際の Codex Review と対象 commit の marker を持つ review body を確認する。一般の task reply や環境作成案内の `COMMENTED` record はコードレビューの証拠にしない。
 現在の head の `CHANGES_REQUESTED` / `PENDING` / `DISMISSED` review は未完了として扱う。
 空の bot 集合や古い head の反応では完了にしない。未解決 thread は残せず、Actions writer 自身を external reviewer には数えない。
 
