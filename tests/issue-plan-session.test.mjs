@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -297,7 +296,7 @@ test("defaults the event path and workspace from GitHub Actions environment", as
 test("reads and parses the GitHub event file by default", async () => {
   const startIssuePlanSession = requireStartIssuePlanSession();
   const deadlineScheduler = createFakeDeadlineScheduler();
-  const directory = mkdtempSync(join(tmpdir(), "issue-plan-event-"));
+  const directory = mkdtempSync(join(process.cwd(), ".issue-plan-event-"));
   const path = join(directory, "event.json");
   const client = new FakeAppServer();
 
@@ -884,7 +883,7 @@ test("runnable job fails when the deadline expires or startup fails", async () =
 });
 
 test("direct CLI execution exits nonzero for an expired event without Codex", () => {
-  const directory = mkdtempSync(join(tmpdir(), "issue-plan-expired-cli-"));
+  const directory = mkdtempSync(join(process.cwd(), ".issue-plan-expired-cli-"));
   const path = join(directory, "event.json");
   const expiredEvent = structuredClone(issueEvent);
   expiredEvent.issue.created_at = "2020-01-01T00:00:00.000Z";
