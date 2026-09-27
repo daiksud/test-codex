@@ -28,7 +28,7 @@ function fixture() {
       throw new Error(`Unexpected request ${method}`);
     },
   };
-  return { requests, session: { workspace, issue, threadId, client, deadline } };
+  return { requests, session: { workspace, issue, threadId, client, deadline, actionsRunUrl: "https://github.com/daiksud/test-codex/actions/runs/9001" } };
 }
 
 function start(session, planReceipt = receipt) {
@@ -86,6 +86,7 @@ test("starts the same thread with its owned workspace profile and current model"
   assert.ok(prompt.includes(issue.url) && prompt.includes(issue.body));
   assert.ok(prompt.includes(approval.approvedPlan) && prompt.includes(receipt.url));
   assert.ok(prompt.includes("codex/issue-19") && prompt.includes("GITHUB_TOKEN"));
+  assert.ok(prompt.includes(fake.session.actionsRunUrl), "the exact status target run URL must be supplied");
   for (const phrase of ["test", "lint", "build", "self-review", "bot", "ToDo", "merge", "cleanup", "retry", "Codex verification"]) {
     assert.ok(prompt.toLowerCase().includes(phrase.toLowerCase()), `missing delivery instruction ${phrase}`);
   }

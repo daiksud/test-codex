@@ -16,6 +16,7 @@ test("the default CLI controller composes Plan, approval, publication, continuat
       startJob: async () => {
         session = await runIssuePlanJob({
           eventPath: "/fixture/event.json", workspace: "/fixture/checkout",
+          env: { GITHUB_SERVER_URL: "https://github.com", GITHUB_REPOSITORY: "daiksud/test-codex", GITHUB_RUN_ID: "9001" },
           nowMs: Date.parse(fake.event.issue.created_at), readEvent: () => fake.event,
           createClient: () => fake.client, deadlineScheduler: fake.scheduler,
         });
@@ -103,7 +104,7 @@ function fixture() {
     [root + "/issues/19/timeline?per_page=100&page=1"]: [{ event: "cross-referenced", source: { issue: { number: 7, repository: { full_name: repository }, pull_request: { url: root + "/pulls/7" } } } }],
     [root + "/git/ref/heads/main"]: { ref: "refs/heads/main", object: { sha: mainSha } },
     [root + "/rules/branches/main"]: [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: "Codex verification" }] } }],
-    [root + `/commits/${headSha}/statuses?per_page=100&page=1`]: [{ context: "Codex verification", state: "success", url: root + `/statuses/${headSha}` }],
+    [root + `/commits/${headSha}/statuses?per_page=100&page=1`]: [{ context: "Codex verification", state: "success", url: root + `/statuses/${headSha}`, target_url: `https://github.com/${repository}/actions/runs/9001`, creator: { login: "github-actions[bot]" } }],
     [root + `/commits/${headSha}/check-runs?filter=latest&per_page=100&page=1`]: { check_runs: [] },
     [root + "/pulls/7/reviews?per_page=100&page=1"]: [{ user: { type: "Bot", login: "fixture-review[bot]" }, commit_id: headSha, state: "APPROVED", submitted_at: "2026-09-27T01:00:00Z" }],
   };

@@ -9,7 +9,8 @@ const root = `https://api.github.com/repos/${repository}`;
 const headSha = "b".repeat(40);
 const facts = { repository, issueNumber: 19, pullRequestNumber: 7, headSha, mainSha: "a".repeat(40) };
 const context = "Codex verification";
-const status = { context, state: "success", url: root + `/statuses/${headSha}` };
+const actionsRunUrl = `https://github.com/${repository}/actions/runs/9001`;
+const status = { context, state: "success", url: root + `/statuses/${headSha}`, target_url: actionsRunUrl, creator: { login: "github-actions[bot]" } };
 const check = { name: context, head_sha: headSha, status: "completed", conclusion: "success" };
 function fixture() {
   const controller = new AbortController();
@@ -20,7 +21,7 @@ function fixture() {
     [root + `/commits/${headSha}/statuses?per_page=100&page=1`]: [status],
     [root + `/commits/${headSha}/check-runs?filter=latest&per_page=100&page=1`]: { check_runs: [] },
   };
-  return { calls, payloads, controller, session: { issue: { repository, number: 19 }, client: { failure: new Promise(() => {}) }, deadline, signal: controller.signal },
+  return { calls, payloads, controller, session: { actionsRunUrl, issue: { repository, number: 19 }, client: { failure: new Promise(() => {}) }, deadline, signal: controller.signal },
     fetchImpl: async (url, options) => { calls.push(url); assert.equal(options.method, "GET"); assert.ok(Object.hasOwn(payloads, url), url); return { ok: true, status: 200, headers: new Headers(), json: async () => payloads[url] }; } };
 }
 function audit(fake, value = facts, options = {}) {
@@ -34,6 +35,22 @@ test("requires authenticated check read permission without extra write scope", (
   const workflow = readFileSync(new URL("../.github/workflows/codex-issue.yml", import.meta.url), "utf8");
   assert.match(workflow, /^      checks: read$/m);
   assert.doesNotMatch(workflow, /^      checks: write$/m);
+});
+
+test("success statuses require the current Actions run URL and GitHub Actions creator", async () => {
+  for (const change of [
+    { target_url: null }, { target_url: undefined },
+    { target_url: actionsRunUrl.replace("9001", "9002") },
+    { target_url: "https://example.test/forged" },
+    { creator: null }, { creator: { login: "fixture-human" } },
+  ]) {
+    const fake = fixture(); statuses(fake, [{ ...status, ...change }]);
+    await assert.rejects(audit(fake), error => error.code === "ISSUE_DELIVERY_FINDING" && /provenance|Actions/i.test(error.message));
+  }
+  const unbound = fixture(); delete unbound.session.actionsRunUrl;
+  await assert.rejects(audit(unbound), /Actions|bound|run URL/i);
+  const checkOnly = fixture(); delete checkOnly.session.actionsRunUrl; statuses(checkOnly, []); checks(checkOnly, [check]);
+  assert.deepEqual(await audit(checkOnly), { headSha, requiredContext: context });
 });
 
 test("accepts status-only, check-only and both passing sources on the exact head", async () => {

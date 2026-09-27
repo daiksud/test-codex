@@ -353,6 +353,15 @@ export async function startIssuePlanSession({
 
   const event = await readEvent(eventPath);
   const issue = normalizeIssueEvent(event);
+  const { GITHUB_SERVER_URL: serverUrl, GITHUB_REPOSITORY: runRepository, GITHUB_RUN_ID: runId } = env;
+  let actionsRunUrl = null;
+  if ([serverUrl, runRepository, runId].some(value => value !== undefined)) {
+    if (serverUrl !== "https://github.com" || runRepository !== issue.repository ||
+        typeof runId !== "string" || !/^[1-9]\d*$/.test(runId)) {
+      throw new Error("Invalid Actions run metadata or repository/server binding");
+    }
+    actionsRunUrl = `${serverUrl}/${runRepository}/actions/runs/${runId}`;
+  }
   const currentTimeMs = nowMs ?? Date.now();
   let client;
   let clientClosed = false;
@@ -405,6 +414,7 @@ export async function startIssuePlanSession({
       remainingMs: preflight.remainingMs,
       workspace,
       issue,
+      actionsRunUrl,
       client,
       deadline,
       signal: preparation.signal,
@@ -864,6 +874,7 @@ export async function startApprovedIssueImplementation(session, approval, receip
     "Use the supplied GITHUB_TOKEN through GH_TOKEN for authorized repository writes. Its GitHub Actions bot identity is intentional; do not change accounts or global configuration. Never print credentials or broad credential-bearing configuration.",
     "Implement the approved Plan within the Issue scope, run repository test, lint, and build checks, self-review, then commit, push and open a pull request. Use English Conventional Commits.",
     "GITHUB_TOKEN pushes do not trigger push CI. For every PR head, report a pending Codex verification commit status with the Actions run URL, execute the repository checks on that exact head, and report success only if those checks succeed. Update the status after every fix.",
+    ...(session.actionsRunUrl ? [`Use this exact Actions run URL as the commit status target_url: ${session.actionsRunUrl}.`] : []),
     "While CI is pending, perform self-review, add findings to ToDo and fix them. For bot review, wait for configured bots, address valid findings and obtain a completed review for the latest head. Do not request human review.",
     "Merge only when all required CI is successful, bot review is complete, every actionable finding is resolved, and ToDo is empty. Resolve conflicts without weakening repository protections; squash merge through the PR.",
     "After merge, return to main, fetch and sync with remote, delete the local working branch, and verify a clean working tree. Verify the Issue is closed and do not carry this Issue's state into the next one.",
@@ -1182,6 +1193,14 @@ export async function verifyIssueRequiredCi(session, facts, options = {}) {
   if (latestStatus) {
     if (latestStatus.url !== `${root}/statuses/${headSha}` || !["success", "pending", "failure", "error"].includes(latestStatus.state)) {
       throw new Error("Invalid CI status identity or state");
+    }
+    const runUrlPrefix = `https://github.com/${issue.repository}/actions/runs/`;
+    if (typeof session.actionsRunUrl !== "string" || !session.actionsRunUrl.startsWith(runUrlPrefix) ||
+        !/^[1-9]\d*$/.test(session.actionsRunUrl.slice(runUrlPrefix.length))) {
+      throw new Error("A bound current Actions run URL is required for CI statuses");
+    }
+    if (latestStatus.creator?.login !== "github-actions[bot]" || latestStatus.target_url !== session.actionsRunUrl) {
+      throw issueDeliveryFinding("Required CI status has no matching Actions run provenance");
     }
     if (latestStatus.state !== "success") throw issueDeliveryFinding("Required CI status is not successful on the exact PR head");
   }

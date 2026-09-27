@@ -177,6 +177,41 @@ function requirePostIssueFailureComment() {
   return issueFlow.postIssueFailureComment;
 }
 
+test("captures the Actions run URL before client preparation can mutate its environment", async () => {
+  const env = { GITHUB_SERVER_URL: "https://github.com", GITHUB_REPOSITORY: "daiksud/test-codex", GITHUB_RUN_ID: "9001" };
+  const scheduler = createFakeDeadlineScheduler(), client = new FakeAppServer();
+  const session = await requireStartIssuePlanSession()({
+    env, eventPath, workspace, nowMs: Date.parse(issueCreatedAt), deadlineScheduler: scheduler,
+    readEvent: () => issueEvent, createClient: () => { env.GITHUB_RUN_ID = "9002"; return client; },
+  });
+  assert.equal(session.actionsRunUrl, "https://github.com/daiksud/test-codex/actions/runs/9001");
+  session.deadline.cancel(); client.close();
+});
+
+test("allows absent Actions metadata but rejects partial, invalid or unrelated run metadata before launch", async () => {
+  const valid = { GITHUB_SERVER_URL: "https://github.com", GITHUB_REPOSITORY: "daiksud/test-codex", GITHUB_RUN_ID: "9001" };
+  for (const env of [
+    { GITHUB_RUN_ID: "9001" }, { ...valid, GITHUB_RUN_ID: undefined },
+    { ...valid, GITHUB_RUN_ID: "0" }, { ...valid, GITHUB_RUN_ID: "9e3" },
+    { ...valid, GITHUB_REPOSITORY: "fixture/other" },
+    { ...valid, GITHUB_SERVER_URL: "https://example.test" },
+  ]) {
+    let launches = 0;
+    await assert.rejects(requireStartIssuePlanSession()({
+      env, eventPath, workspace, nowMs: Date.parse(issueCreatedAt), deadlineScheduler: createFakeDeadlineScheduler(),
+      readEvent: () => issueEvent, createClient: () => { launches += 1; return new FakeAppServer(); },
+    }), /Actions|metadata|repository|server/i);
+    assert.equal(launches, 0);
+  }
+  const client = new FakeAppServer();
+  const session = await requireStartIssuePlanSession()({
+    env: {}, eventPath, workspace, nowMs: Date.parse(issueCreatedAt), deadlineScheduler: createFakeDeadlineScheduler(),
+    readEvent: () => issueEvent, createClient: () => client,
+  });
+  assert.equal(session.actionsRunUrl, null);
+  session.deadline.cancel(); client.close();
+});
+
 test("starts one Plan session from the GitHub issue event and retains its client", async () => {
   const startIssuePlanSession = requireStartIssuePlanSession();
   const deadlineScheduler = createFakeDeadlineScheduler();

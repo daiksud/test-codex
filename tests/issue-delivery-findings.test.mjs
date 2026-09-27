@@ -15,13 +15,13 @@ function fixture() {
     [root + "/issues/19/timeline?per_page=100&page=1"]: [{ event: "cross-referenced", source: { issue: { number: 7, repository: { full_name: repository }, pull_request: { url: root + "/pulls/7" } } } }],
     [root + "/git/ref/heads/main"]: { ref: "refs/heads/main", object: { sha: mainSha } },
     [root + "/rules/branches/main"]: [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: "Codex verification" }] } }],
-    [root + `/commits/${headSha}/statuses?per_page=100&page=1`]: [{ context: "Codex verification", state: "success", url: root + `/statuses/${headSha}` }],
+    [root + `/commits/${headSha}/statuses?per_page=100&page=1`]: [{ context: "Codex verification", state: "success", url: root + `/statuses/${headSha}`, target_url: `https://github.com/${repository}/actions/runs/9001`, creator: { login: "github-actions[bot]" } }],
     [root + `/commits/${headSha}/check-runs?filter=latest&per_page=100&page=1`]: { check_runs: [] },
     [root + "/pulls/7/reviews?per_page=100&page=1"]: [],
   };
   const connections = { reviewRequests: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }, reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } };
   const client = { failure: new Promise(() => {}), implementationProfile: "codex_issue_workspace_fixture", request: async (method, params) => { rpc.push({ method, params }); return method === "thread/read" ? { thread: { id: threadId, model: "gpt-6-sol", reasoningEffort: "high" } } : { turn: { id: "finding-turn" } }; } };
-  const session = { issue: { repository, number: 19, url: `https://github.com/${repository}/issues/19` }, threadId, workspace: "/runner/workspace", client, deadline: { expired: false, expiration: new Promise(() => {}), error: null }, signal: new AbortController().signal };
+  const session = { actionsRunUrl: `https://github.com/${repository}/actions/runs/9001`, issue: { repository, number: 19, url: `https://github.com/${repository}/issues/19` }, threadId, workspace: "/runner/workspace", client, deadline: { expired: false, expiration: new Promise(() => {}), error: null }, signal: new AbortController().signal };
   const options = { env: { GH_TOKEN: "fixture-token" }, fetchImpl: async (url, input) => {
     calls.push({ url, input }); let data;
     if (url === "https://api.github.com/graphql") { assert.equal(input.method, "POST"); const body = JSON.parse(input.body); assert.match(body.query, /^query /); const field = body.operationName === "IssueReviewRequests" ? "reviewRequests" : "reviewThreads"; data = { data: { repository: { pullRequest: { number: 7, headRefOid: headSha, [field]: connections[field] } } } }; }
