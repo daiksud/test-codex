@@ -189,3 +189,43 @@ test("natural completion after interrupt request reports only what was requested
   assert.deepEqual(await quiesce(fake), { interruptRequestedTurnId: owned.id });
   assert.equal(fake.calls.filter(call => call.method === "turn/interrupt").length, 1);
 });
+
+
+function interruptFailure(fake, error) {
+  const original = fake.session.client.request;
+  fake.session.client.request = async (method, params) => {
+    if (method === "turn/interrupt") { fake.calls.push({ method, params }); throw error; }
+    return original(method, params);
+  };
+}
+
+test("cleanup rechecks matching terminal state when the owned turn finishes before interruption", async () => {
+  const assertTerminal = async (fake) => {
+    assert.deepEqual(await quiesce(fake), { interruptRequestedTurnId: owned.id });
+    assert.deepEqual(fake.calls.map(call => call.method), ["thread/turns/list", "turn/interrupt", "thread/turns/list"]);
+  };
+  for (const status of ["completed", "interrupted", "failed"]) {
+    const fake = fixture([page([owned]), page([{ ...owned, status }])]);
+    interruptFailure(fake, Object.assign(new Error("no active turn to interrupt"), { code: -32600 }));
+    await assertTerminal(fake);
+  }
+});
+
+test("cleanup does not reinterpret other invalid-request codes or messages as natural completion", async () => {
+  for (const [code, message] of [[-32600, "wrong active turn"], [-32601, "no active turn to interrupt"], [-32602, "no active turn to interrupt"]]) {
+    const error = Object.assign(new Error(message), { code });
+    const fake = fixture([page([owned])]); interruptFailure(fake, error);
+    await assert.rejects(quiesce(fake), value => value === error);
+    assert.deepEqual(fake.calls.map(call => call.method), ["thread/turns/list", "turn/interrupt"]);
+  }
+});
+
+test("no-active-turn response still requires valid owned terminal state before cleanup", async () => {
+  for (const turns of [[{ id: "foreign", status: "inProgress" }, { ...owned, status: "completed" }], [owned, { id: "foreign", status: "inProgress" }], [], [{ ...owned, status: "unknown" }]]) {
+    const fake = fixture([page([owned]), page(turns)]);
+    interruptFailure(fake, Object.assign(new Error("no active turn to interrupt"), { code: -32600 }));
+    await assert.rejects(quiesce(fake), error => error.code !== -32600 && /owned|active|tracked|Invalid/i.test(error.message));
+    assert.deepEqual(fake.calls.map(call => call.method), ["thread/turns/list", "turn/interrupt", "thread/turns/list"]);
+    assert.equal(fake.calls.filter(call => call.method === "turn/interrupt").length, 1);
+  }
+});

@@ -560,6 +560,10 @@ export async function runIssuePlanCli({
   }
 }
 
+function isNoActiveTurnError(error) {
+  return error.code === -32600 && error.message === "no active turn to interrupt";
+}
+
 export async function waitForIssuePlanApproval(session) {
   const { client, deadline, threadId, turnId: planTurnId } = session;
   const prefix = "PLEASE IMPLEMENT THIS PLAN:\n";
@@ -607,7 +611,7 @@ export async function waitForIssuePlanApproval(session) {
         threadId, turnId: approval.approvalTurnId,
       }));
     } catch (error) {
-      if (error.code !== -32600 || error.message !== "no active turn to interrupt") throw error;
+      if (!isNoActiveTurnError(error)) throw error;
       // The read-only UI turn may already have finished; its terminal event is still required.
     }
   }
@@ -1055,7 +1059,8 @@ export async function quiesceIssueForCleanup(session, {
     await runIssueSessionStage(session, () => client.request("turn/interrupt", { threadId, turnId: trackedId }));
   } catch (error) {
     if (deadline.expired) throw deadline.error;
-    if ([-32600, -32601, -32602].includes(error.code)) throw error;
+    if ([-32600, -32601, -32602].includes(error.code) &&
+        !isNoActiveTurnError(error)) throw error;
     // The interrupt may have applied. Read state without replaying it.
   }
   while (true) {
