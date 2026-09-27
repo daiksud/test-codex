@@ -21,11 +21,13 @@ class FakeAppServer {
     events = null,
     turnIds = ["turn-plan"],
     turnStartError = null,
+    remoteStatus = { status: "connected", installationId: "runner", serverName: "Mac mini", environmentId: null },
   } = {}) {
     this.requests = [];
     this.notifications = [];
     this.turnIds = [...turnIds];
     this.turnStartError = turnStartError;
+    this.remoteStatus = remoteStatus;
     this.failure = new Promise(() => {});
     this.events =
       events ?? [
@@ -69,6 +71,8 @@ class FakeAppServer {
     switch (method) {
       case "initialize":
         return {};
+      case "remoteControl/status/read":
+        return this.remoteStatus;
       case "mcpServerStatus/list":
         return this.mcpPages.shift();
       case "collaborationMode/list":
@@ -112,6 +116,7 @@ test("starts one persistent Plan turn with read-only, no-network policy", async 
     appServer.requests.map(({ method }) => method),
     [
       "initialize",
+      "remoteControl/status/read",
       "mcpServerStatus/list",
       "collaborationMode/list",
       "model/list",
@@ -166,6 +171,79 @@ test("starts one persistent Plan turn with read-only, no-network policy", async 
     appServer.requests.filter(({ method }) => method === "turn/start").length,
     1,
   );
+});
+
+test("Remote reconnects before any Plan thread starts without changing preferences", async () => {
+  const client = new FakeAppServer({ remoteStatus: { status: "connecting", installationId: "runner", serverName: "Mac mini" } });
+  client.events.unshift(
+    { method: "unrelated/notification", params: {} },
+    { method: "remoteControl/status/changed", params: { status: "errored", installationId: "runner", serverName: "Mac mini" } },
+    { method: "remoteControl/status/changed", params: { status: "connected", installationId: "runner", serverName: "Mac mini", environmentId: null } },
+  );
+  const nextEvent = client.nextEvent.bind(client);
+  let connectionObserved = false;
+  client.nextEvent = async () => {
+    const event = await nextEvent();
+    if (!connectionObserved) assert.equal(client.requests.some(r => r.method === "thread/start"), false);
+    if (event.method === "remoteControl/status/changed" && event.params.status === "connected") connectionObserved = true;
+    return event;
+  };
+  const result = await startIssuePlanTurn(client, { workspace, issue });
+  assert.equal(connectionObserved, true);
+  assert.equal(result.plan, planText);
+  assert.deepEqual(client.requests.filter(r => r.method.startsWith("remoteControl/")).map(r => r.method), ["remoteControl/status/read"]);
+});
+
+test("disabled or malformed Remote status prevents Plan startup", async () => {
+  for (const remoteStatus of [
+    { status: "disabled", installationId: "runner", serverName: "Mac mini" },
+    { status: "unknown", installationId: "runner", serverName: "Mac mini" },
+    { status: "connected", serverName: "Mac mini" },
+    { status: "connected", installationId: "runner", serverName: 7 },
+    { status: "connected", installationId: "runner", serverName: "Mac mini", environmentId: 7 },
+    null,
+  ]) {
+    for (const source of ["read", "notification"]) {
+      const client = new FakeAppServer({ remoteStatus: source === "read" ? remoteStatus : { status: "connecting", installationId: "runner", serverName: "Mac mini" } });
+      if (source === "notification") client.events.unshift({ method: "remoteControl/status/changed", params: remoteStatus });
+      await assert.rejects(startIssuePlanTurn(client, { workspace, issue }), /Remote/);
+      assert.equal(client.requests.some(r => r.method === "thread/start"), false);
+    }
+  }
+});
+
+test("Remote read and event waits stop on deadline or client loss before starting Plan", async () => {
+  for (const stage of ["read", "event"]) {
+    for (const cancellation of ["deadline", "client"]) {
+      const client = new FakeAppServer({ remoteStatus: { status: "connecting", installationId: "runner", serverName: "Mac mini" } });
+      let resolveWait;
+      let entered;
+      const waiting = new Promise(resolve => { entered = resolve; });
+      const wait = () => new Promise(resolve => { resolveWait = resolve; entered(); });
+      if (stage === "read") {
+        const request = client.request.bind(client);
+        client.request = (method, params) => method === "remoteControl/status/read" ? wait() : request(method, params);
+      } else client.nextEvent = wait;
+      const error = new Error("Remote test cancellation");
+      let rejectDeadline;
+      let rejectClient;
+      const deadline = { expired: false, error, expiration: new Promise((resolve, reject) => { rejectDeadline = reject; }) };
+      client.failure = new Promise((resolve, reject) => { rejectClient = reject; });
+      deadline.expiration.catch(() => {});
+      client.failure.catch(() => {});
+      const startup = startIssuePlanTurn(client, { workspace, issue, deadline });
+      const failed = assert.rejects(startup, value => value === error);
+      failed.catch(() => {});
+      await Promise.race([waiting, startup.then(() => { throw new Error("Plan started without waiting for Remote"); })]);
+      if (cancellation === "deadline") { deadline.expired = true; rejectDeadline(error); }
+      else rejectClient(error);
+      await failed;
+      const connected = { status: "connected", installationId: "runner", serverName: "Mac mini" };
+      resolveWait(stage === "read" ? connected : { method: "remoteControl/status/changed", params: connected });
+      await Promise.resolve();
+      assert.equal(client.requests.some(r => r.method === "thread/start"), false);
+    }
+  }
 });
 
 function terminalTurn(id, status, codexErrorInfo) {

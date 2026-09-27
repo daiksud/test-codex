@@ -60,6 +60,7 @@ export function spawnCodexAppServer({
     [
       "app-server",
       "--stdio",
+      "--remote-control",
       "--disable",
       "apps",
       "--disable",
@@ -1471,6 +1472,31 @@ async function readPlanTurnResult(client, threadId, turnId) {
   }
 }
 
+async function waitForIssueRemoteConnection(client, deadline) {
+  let initialRead = true;
+  while (true) {
+    if (deadline?.expired) throw deadline.error;
+    const result = await Promise.race([
+      initialRead ? client.request("remoteControl/status/read") : client.nextEvent(),
+      client.failure,
+      ...(deadline ? [deadline.expiration] : []),
+    ]);
+    if (deadline?.expired) throw deadline.error;
+    const status = initialRead ? result : result?.params;
+    const isStatus = initialRead || result?.method === "remoteControl/status/changed";
+    initialRead = false;
+    if (!isStatus) continue;
+    if (!status || !["disabled", "connecting", "connected", "errored"].includes(status.status) ||
+        typeof status.installationId !== "string" || typeof status.serverName !== "string" ||
+        (status.environmentId !== undefined && status.environmentId !== null && typeof status.environmentId !== "string")) {
+      throw new Error("Invalid Remote connection status");
+    }
+    if (status.status === "disabled") throw new Error("Remote control is disabled");
+    if (status.status === "connected") return;
+    // The owned app-server retries connecting/errored states with its own backoff.
+  }
+}
+
 export async function startIssuePlanTurn(client, {
   workspace, issue, deadline, waitBeforeRetry = waitForIssueRetry,
 }) {
@@ -1483,6 +1509,7 @@ export async function startIssuePlanTurn(client, {
     capabilities: { experimentalApi: true },
   });
   client.notify("initialized", {});
+  await waitForIssueRemoteConnection(client, deadline);
 
   const mcpServers = await listAll(client, "mcpServerStatus/list", {
     detail: "toolsAndAuthOnly",

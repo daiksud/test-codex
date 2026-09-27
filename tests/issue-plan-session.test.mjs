@@ -64,6 +64,8 @@ class FakeAppServer {
     switch (method) {
       case "initialize":
         return {};
+      case "remoteControl/status/read":
+        return { status: "connected", installationId: "runner", serverName: "Mac mini" };
       case "mcpServerStatus/list":
         return { data: [] };
       case "collaborationMode/list":

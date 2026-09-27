@@ -66,6 +66,7 @@ test("spawns a job-owned app-server without inventing MCP entries", () => {
       args: [
         "app-server",
         "--stdio",
+        "--remote-control",
         "--disable",
         "apps",
         "--disable",
