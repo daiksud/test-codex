@@ -918,6 +918,26 @@ export async function continueIssueAfterFinding(handoff, outcome) {
   return startAuthorizedIssueTurn(session, profile, prompt);
 }
 
+export async function startIssueCleanup(handoff, reason) {
+  if (typeof reason !== "string" || !reason.trim()) throw new Error("A nonempty failure reason is required for cleanup");
+  const { session, approval, receipt } = handoff;
+  const { client, deadline, issue } = session;
+  if (deadline.expired) throw deadline.error;
+  requireApprovedIssueReceipt(session, approval, receipt);
+  const profile = client.implementationProfile;
+  if (typeof profile !== "string" || !profile.startsWith("codex_issue_workspace_")) {
+    throw new Error("The owned workspace implementation profile is required");
+  }
+  const prompt = [
+    `The delivery of Issue ${issue.url} failed: ${reason}. The approved Plan remains recorded at ${receipt.url}. This turn is limited to failure cleanup.`,
+    "Perform Git operations yourself using Git commands directly. Inspect actual local and remote state and identify Issue-owned changes before cleanup. Fetch the remote main and synchronize local main with it.",
+    `Switch to main first, then delete only the local codex/issue-${issue.number} branch if it exists. Never delete main or other local branches. Remove only Issue-owned changes/files needed to restore a clean workspace; preserve unrelated work.`,
+    "Do not begin or resume implementation, commit, push, create or update a PR, or merge. Do not delete remote branches, close the Issue or modify repository settings. Do not ask for approval or user input. Do not change accounts or global configuration, use worktrees/containers/Projects, expose credentials, or write outside the owned workspace.",
+    "The original process remains failed regardless of cleanup. Return the constrained JSON report with status failed, the actual local branch/main SHA/clean state and remaining cleanup ToDo. Never claim the original Issue delivery succeeded. Stay within the original hard deadline.",
+  ].join("\n\n");
+  return startAuthorizedIssueTurn(session, profile, prompt);
+}
+
 export function parseIssueDeliveryReport(result) {
   if (result?.status !== "completed") throw new Error("Implementation turn must be completed before reading a delivery report");
   let report;
