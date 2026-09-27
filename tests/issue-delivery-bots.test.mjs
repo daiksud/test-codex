@@ -6,7 +6,7 @@ const repository = "daiksud/test-codex", headSha = "b".repeat(40);
 const facts = { repository, issueNumber: 19, pullRequestNumber: 7, headSha, mainSha: "a".repeat(40) };
 const bot = { __typename: "Bot", login: "chatgpt-codex-connector" };
 const human = { __typename: "User", login: "fixture-human" };
-const review = { user: { type: "Bot", login: "chatgpt-codex-connector[bot]" }, state: "COMMENTED", commit_id: headSha, submitted_at: "2026-09-27T00:00:00Z" };
+const review = { user: { type: "Bot", login: "chatgpt-codex-connector[bot]" }, body: `### 💡 Codex Review\n\n**Reviewed commit:** \`${headSha.slice(0,10)}\``, state: "COMMENTED", commit_id: headSha, submitted_at: "2026-09-27T00:00:00Z" };
 function connection(nodes = [], endCursor = null) { return { nodes, pageInfo: { hasNextPage: endCursor !== null, endCursor } }; }
 function thread(author = bot, isResolved = true) { return { id: "fixture-thread", isResolved, comments: connection([{ author }]) }; }
 function fixture() {
@@ -259,4 +259,24 @@ test("unresolved Actions-writer replies still block and cannot replace the confi
   const missingConnector = fixture(); missingConnector.reviews[0] = [];
   missingConnector.threads.first = connection([thread(actionsWriter)]);
   await assert.rejects(audit(missingConnector), error => error.code === "ISSUE_DELIVERY_FINDING" && /Bot|review/i.test(error.message));
+});
+
+test("a non-review connector COMMENTED response cannot substitute for code review", async () => {
+  for (const body of ["", "To use Codex here, create an environment for this repo.", "### 💡 Codex Review", `**Reviewed commit:** \`${headSha.slice(0,10)}\``, review.body.replace(headSha.slice(0,10), "c".repeat(10))]) {
+    const fake = fixture(); fake.reviews[0] = [{ ...review, body }];
+    await assert.rejects(audit(fake), error => error.code === "ISSUE_DELIVERY_FINDING" && /Bot|review/i.test(error.message));
+  }
+});
+
+test("a non-review connector reply does not hide valid review approval or no-findings reaction", async () => {
+  const approved = fixture(); approved.reviews[0] = [{ ...review, state: "APPROVED", body: "" }];
+  assert.deepEqual(await audit(approved), { headSha, bots: [bot.login] });
+  const noFindings = thumbFixture(); noFindings.reviews[0] = [{ ...review, body: "" }];
+  assert.deepEqual(await audit(noFindings), { headSha, bots: [bot.login] });
+  assert.ok(noFindings.calls.some(call => call.url.includes("/issues/comments/42/reactions?")));
+});
+
+test("a later non-review connector reply does not erase a genuine current-head code review", async () => {
+  const fake = fixture(); fake.reviews[0] = [review, { ...review, body: "" }];
+  assert.deepEqual(await audit(fake), { headSha, bots: [bot.login] });
 });

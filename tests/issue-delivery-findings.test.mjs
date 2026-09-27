@@ -17,7 +17,7 @@ function fixture() {
     [root + "/rules/branches/main"]: [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: "Codex verification" }] } }],
     [root + `/commits/${headSha}/statuses?per_page=100&page=1`]: [{ context: "Codex verification", state: "success", url: root + `/statuses/${headSha}`, target_url: `https://github.com/${repository}/actions/runs/9001`, creator: { login: "github-actions[bot]" } }],
     [root + `/commits/${headSha}/check-runs?filter=latest&per_page=100&page=1`]: { check_runs: [] },
-    [root + "/pulls/7/reviews?per_page=100&page=1"]: [{ user: { type: "Bot", login: "chatgpt-codex-connector[bot]" }, state: "COMMENTED", commit_id: headSha, submitted_at: "2026-09-27T00:00:00Z" }],
+    [root + "/pulls/7/reviews?per_page=100&page=1"]: [{ user: { type: "Bot", login: "chatgpt-codex-connector[bot]" }, body: `### 💡 Codex Review\n\n**Reviewed commit:** \`${headSha.slice(0,10)}\``, state: "COMMENTED", commit_id: headSha, submitted_at: "2026-09-27T00:00:00Z" }],
     [root + "/issues/7/comments?per_page=100&page=1"]: [],
   };
   const connections = { reviewRequests: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }, reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } };

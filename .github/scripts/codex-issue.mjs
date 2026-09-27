@@ -1296,6 +1296,12 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
         }
         const login = botLogin(review.user.login);
         if (login === ISSUE_AUTOMATION_BOT) continue;
+        if (login === ISSUE_REVIEW_BOT && review.state === "COMMENTED") {
+          const reviewedCommit = typeof review.body === "string" &&
+            review.body.match(/\*\*Reviewed commit:\*\*\s*`([a-f0-9]{7,40})`/i)?.[1];
+          if (!reviewedCommit || !review.body.includes("Codex Review") ||
+              !review.commit_id.toLowerCase().startsWith(reviewedCommit.toLowerCase())) continue;
+        }
         participants.add(login);
         latestReviews.set(login, review);
       }
