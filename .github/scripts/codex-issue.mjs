@@ -804,6 +804,8 @@ async function startAuthorizedIssueTurn(session, profile, prompt) {
   if (thread?.id !== threadId || typeof thread.model !== "string" || !thread.model) {
     throw new Error("Current thread or model metadata is unavailable");
   }
+  const context = session.deliveryContext;
+  if (context) context.turnId = null;
   const started = await runIssueSessionStage(session, () => client.request("turn/start", {
     threadId, cwd: workspace, permissions: profile, approvalPolicy: "never",
     outputSchema: DELIVERY_REPORT_SCHEMA,
@@ -818,6 +820,7 @@ async function startAuthorizedIssueTurn(session, profile, prompt) {
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex app-server did not return an implementation turn ID");
   }
+  if (context) context.turnId = started.turn.id;
   return started.turn.id;
 }
 
@@ -921,6 +924,61 @@ export async function continueIssueAfterFinding(handoff, outcome) {
     `Approved Plan (verbatim):\n${receipt.approvedPlan}`,
   ].join("\n\n");
   return startAuthorizedIssueTurn(session, profile, prompt);
+}
+
+export async function quiesceIssueForCleanup(session, {
+  waitBeforePoll = waitForIssueRetry,
+} = {}) {
+  const { client, deadline, threadId, deliveryContext: context } = session;
+  if (deadline.expired) throw deadline.error;
+  if (!context) throw new Error("Retained approved delivery context is required");
+  requireApprovedIssueReceipt(session, context.approval, context.receipt);
+  const trackedId = context.turnId;
+  if (!(trackedId === null || (typeof trackedId === "string" && trackedId))) {
+    throw new Error("Invalid tracked owned turn ID");
+  }
+  async function readState() {
+    const turns = [];
+    const cursors = new Set();
+    let cursor = null;
+    do {
+      const page = await runIssueSessionStage(session, () => client.request("thread/turns/list", {
+        threadId, itemsView: "notLoaded", sortDirection: "desc", limit: 100,
+        ...(cursor === null ? {} : { cursor }),
+      }));
+      if (!Array.isArray(page?.data) || page.data.some(turn =>
+        typeof turn?.id !== "string" || !turn.id ||
+        !["completed", "interrupted", "failed", "inProgress"].includes(turn.status))) {
+        throw new Error("Invalid owned turn-state response");
+      }
+      turns.push(...page.data);
+      cursor = page.nextCursor ?? null;
+      if (cursor !== null) {
+        if (typeof cursor !== "string" || !cursor || cursors.has(cursor)) throw new Error("Invalid turn pagination cursor");
+        cursors.add(cursor);
+      }
+    } while (cursor !== null);
+    const active = turns.filter(turn => turn.status === "inProgress");
+    if (active.length > 1 || (active.length === 1 && active[0].id !== trackedId)) {
+      throw new Error("An active turn cannot be identified as the owned delivery turn");
+    }
+    if (trackedId !== null && !turns.some(turn => turn.id === trackedId)) {
+      throw new Error("Tracked owned turn state is unavailable");
+    }
+    return active.length === 1;
+  }
+  if (!await readState()) return { interruptRequestedTurnId: null };
+  try {
+    await runIssueSessionStage(session, () => client.request("turn/interrupt", { threadId, turnId: trackedId }));
+  } catch (error) {
+    if (deadline.expired) throw deadline.error;
+    if ([-32600, -32601, -32602].includes(error.code)) throw error;
+    // The interrupt may have applied. Read state without replaying it.
+  }
+  while (true) {
+    await runIssueSessionStage(session, () => waitBeforePoll(1000, { client, deadline }));
+    if (!await readState()) return { interruptRequestedTurnId: trackedId };
+  }
 }
 
 export async function startIssueCleanup(handoff, reason) {

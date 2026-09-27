@@ -133,3 +133,33 @@ test("pending work before a branch or PR exists permits initial creation after s
   assert.match(prompt, /(?:reuse|retain).*existing.*(?:branch|PR)/i);
   assert.match(prompt, /never push directly to main/i);
 });
+
+test("latest owned turn tracking is cleared before startup and recorded only after a valid response", async () => {
+  const fake = fixture();
+  fake.session.deliveryContext = { approval, receipt, turnId: "previous-owned-turn" };
+  const original = fake.session.client.request;
+  fake.session.client.request = async (method, params) => {
+    if (method === "turn/start") assert.equal(fake.session.deliveryContext.turnId, null);
+    return original(method, params);
+  };
+  await resume(fake);
+  assert.equal(fake.session.deliveryContext.turnId, "continuation-turn");
+});
+
+test("ambiguous or missing-ID continuation startup leaves no trusted active turn ID", async () => {
+  for (const mode of ["ambiguous", "missing"]) {
+    const fake = fixture();
+    fake.session.deliveryContext = { approval, receipt, turnId: "previous-owned-turn" };
+    const original = fake.session.client.request;
+    fake.session.client.request = async (method, params) => {
+      if (method === "turn/start") {
+        fake.requests.push({ method, params });
+        if (mode === "ambiguous") throw new Error("outcome unknown");
+        return { turn: {} };
+      }
+      return original(method, params);
+    };
+    await assert.rejects(resume(fake), /outcome unknown|turn ID/i);
+    assert.equal(fake.session.deliveryContext.turnId, null);
+  }
+});
