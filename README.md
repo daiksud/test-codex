@@ -67,6 +67,7 @@ Codex の完了報告だけで成功にせず、Plan コメント、Issue、merg
 そのため Codex は毎回の正確な PR head で repository checks を実行し、Actions run URL 付きの
 `Codex verification` commit status を pending → success に更新する。
 status の作成者が `github-actions[bot]`、`target_url` が session に保持した今回の Actions run URL と一致することも確認する。
+merge 後の照合では、使用する CI 証拠の時刻も確認する。status なら作成時刻、check-run なら完了時刻（両方ある場合は両方）が merge 時刻以前（同時刻を含む）でなければ完了にしない。
 この Issue job では、その status が必須。Actions context のない読み取り確認では、同じ head の GitHub Actions app と同じ repository の run/job URL がある check-run を検証できる。
 人間の追加 workflow 承認は要求しない。`GH_TOKEN` は job の write token で、
 `github-actions[bot]` としての書き込みはこの処理で意図したもの。
