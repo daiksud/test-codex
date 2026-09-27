@@ -733,8 +733,32 @@ function requireApprovedIssueReceipt(session, approval, receipt) {
   }
 }
 
+async function startAuthorizedIssueTurn(session, profile, prompt) {
+  const { client, threadId, workspace } = session;
+  const metadata = await runIssueSessionStage(session, () => client.request("thread/read", { threadId, includeTurns: false }));
+  const thread = metadata?.thread;
+  if (thread?.id !== threadId || typeof thread.model !== "string" || !thread.model) {
+    throw new Error("Current thread or model metadata is unavailable");
+  }
+  const started = await runIssueSessionStage(session, () => client.request("turn/start", {
+    threadId, cwd: workspace, permissions: profile, approvalPolicy: "never",
+    outputSchema: DELIVERY_REPORT_SCHEMA,
+    collaborationMode: {
+      mode: "default", settings: {
+        model: thread.model, reasoning_effort: thread.reasoningEffort ?? null,
+        developer_instructions: null,
+      },
+    },
+    input: [{ type: "text", text: prompt }],
+  }));
+  if (typeof started?.turn?.id !== "string" || !started.turn.id) {
+    throw new Error("Codex app-server did not return an implementation turn ID");
+  }
+  return started.turn.id;
+}
+
 export async function startApprovedIssueImplementation(session, approval, receipt) {
-  const { client, deadline, threadId, workspace, issue } = session;
+  const { client, deadline, issue } = session;
   if (deadline.expired) throw deadline.error;
   requireApprovedIssueReceipt(session, approval, receipt);
   const profile = client.implementationProfile;
@@ -756,32 +780,31 @@ export async function startApprovedIssueImplementation(session, approval, receip
     `Title: ${issue.title}\nIssue body:\n${issue.body}`,
     `Approved Plan (verbatim):\n${receipt.approvedPlan}`,
   ].join("\n\n");
-  async function bounded(operation) {
-    if (deadline.expired) throw deadline.error;
-    const result = await Promise.race([deadline.expiration, client.failure, operation()]);
-    if (deadline.expired) throw deadline.error;
-    return result;
+  return startAuthorizedIssueTurn(session, profile, prompt);
+}
+
+export async function continuePendingIssueDelivery(handoff, outcome) {
+  const report = parseIssueDeliveryReport(outcome?.turn);
+  if (report.status !== "pending") throw new Error("A completed pending delivery report is required");
+  const { session, approval, receipt } = handoff;
+  const { client, deadline, issue } = session;
+  if (deadline.expired) throw deadline.error;
+  requireApprovedIssueReceipt(session, approval, receipt);
+  const profile = client.implementationProfile;
+  if (typeof profile !== "string" || !profile.startsWith("codex_issue_workspace_")) {
+    throw new Error("The owned workspace implementation profile is required");
   }
-  const metadata = await bounded(() => client.request("thread/read", { threadId, includeTurns: false }));
-  const thread = metadata?.thread;
-  if (thread?.id !== threadId || typeof thread.model !== "string" || !thread.model) {
-    throw new Error("Current thread or model metadata is unavailable");
-  }
-  const started = await bounded(() => client.request("turn/start", {
-    threadId, cwd: workspace, permissions: profile, approvalPolicy: "never",
-    outputSchema: DELIVERY_REPORT_SCHEMA,
-    collaborationMode: {
-      mode: "default", settings: {
-        model: thread.model, reasoning_effort: thread.reasoningEffort ?? null,
-        developer_instructions: null,
-      },
-    },
-    input: [{ type: "text", text: prompt }],
-  }));
-  if (typeof started?.turn?.id !== "string" || !started.turn.id) {
-    throw new Error("Codex app-server did not return an implementation turn ID");
-  }
-  return started.turn.id;
+  const prompt = [
+    `Continue Issue ${issue.url} in this same session from the current workspace. The Issue is the sole specification.`,
+    `The approved Plan is already recorded at ${receipt.url}. Inspect actual local and remote state first. Reuse existing branch and PR when present. Do not recreate an existing branch, replay completed mutations, or create a second PR. Create codex/issue-${issue.number} only if the working branch is absent, and create a PR only if it is absent. Do not repost the Plan. Do not ask for approval or user input. Inspect local and remote state before retrying an operation whose outcome is unknown.`,
+    "Perform Git operations yourself with Git commands. Never push directly to main; do not use worktrees, containers, devcontainers, ephemeral sandboxes, or GitHub Projects. Keep writes within this workspace and avoid changing global configuration or exposing credentials.",
+    "Continue the remaining work, run test/lint/build checks and update Codex verification on every exact PR head. Self-review while CI is pending; add findings to ToDo and fix them. Wait for configured bots and handle valid findings without requesting human review.",
+    "Squash merge only after all required CI succeeds, latest-head bot review is complete, actionable findings are resolved and ToDo is empty. Then return to main, fetch/sync with remote, delete the local working branch and verify a clean working tree and closed Issue.",
+    "Stay within the original 24-hour deadline, automatically retry transient failures, and return the constrained JSON delivery report after checking actual state.",
+    `Pending reason: ${report.reason}\nRemaining ToDo: ${JSON.stringify(report.todo)}`,
+    `Approved Plan (verbatim):\n${receipt.approvedPlan}`,
+  ].join("\n\n");
+  return startAuthorizedIssueTurn(session, profile, prompt);
 }
 
 export function parseIssueDeliveryReport(result) {
