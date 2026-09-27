@@ -719,6 +719,37 @@ export async function observeIssueDelivery(handoff, {
   return { turn, report, remoteEvidence };
 }
 
+export async function runApprovedIssueSession(session, {
+  startDelivery = startApprovedIssueDelivery,
+  observeDelivery = observeIssueDelivery,
+  continueDelivery = continuePendingIssueDelivery,
+  retryDelivery = retryIssueImplementation,
+} = {}) {
+  let handoff = await runIssueSessionStage(session, () => startDelivery(session));
+  let transientFailures = 0;
+  while (true) {
+    const outcome = await runIssueSessionStage(session, () => observeDelivery(handoff));
+    if (outcome.report?.status === "complete") {
+      if (!outcome.remoteEvidence) throw new Error("Complete report has no remote audit evidence");
+      return { report: outcome.report, remoteEvidence: outcome.remoteEvidence };
+    }
+    let turnId;
+    if (outcome.report?.status === "pending") {
+      transientFailures = 0;
+      turnId = await runIssueSessionStage(session, () => continueDelivery(handoff, outcome));
+    } else if (outcome.turn?.status === "failed" &&
+        isTransientCodexError(outcome.turn.error?.codexErrorInfo)) {
+      const delayMs = Math.min(60000, 1000 * 2 ** transientFailures++);
+      turnId = await runIssueSessionStage(session, () => retryDelivery(handoff, outcome, { delayMs }));
+    } else {
+      throw new Error(outcome.report?.status === "failed" ?
+        "Codex reported failed delivery" :
+        `Codex implementation turn ended with status ${outcome.turn?.status ?? "unknown"}`);
+    }
+    handoff = { ...handoff, turnId };
+  }
+}
+
 function requireApprovedIssueReceipt(session, approval, receipt) {
   const { issue, threadId } = session;
   if (typeof threadId !== "string" || !threadId ||
