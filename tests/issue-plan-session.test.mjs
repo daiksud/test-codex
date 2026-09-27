@@ -386,10 +386,14 @@ test("CLI stays active after Plan and fails when the retained Issue deadline exp
   let stderr = "";
   let cliFinished = false;
   const reportedFailures = [];
+  let failureSetBeforeComment = false;
+  let diagnosticWrittenBeforeComment = false;
 
   const cli = runIssuePlanCli({
     startJob: async () => session,
     commentIssue: async (issue, reason) => {
+      failureSetBeforeComment = exitCode === 1;
+      diagnosticWrittenBeforeComment = stderr.includes(reason);
       reportedFailures.push({ issue, reason });
     },
     writeStdout: (text) => (stdout += text),
@@ -410,6 +414,8 @@ test("CLI stays active after Plan and fails when the retained Issue deadline exp
   assert.equal(client.closeCount, 1);
   assert.equal(exitCode, 1);
   assert.match(stderr, /Issue deadline expired/);
+  assert.equal(failureSetBeforeComment, true, "failure must be set before best-effort reporting");
+  assert.equal(diagnosticWrittenBeforeComment, true, "primary failure must be logged before reporting");
   assert.deepEqual(reportedFailures, [
     {
       issue: session.issue,
@@ -564,21 +570,34 @@ test("CLI keeps the deadline error when the Issue failure comment fails", async 
 test("deadline comments use the Issue REST endpoint and scoped GitHub token", async () => {
   const postIssueFailureComment = requirePostIssueFailureComment();
   const requests = [];
-
-  await postIssueFailureComment(
-    {
-      repository: "daiksud/test-codex",
-      number: 19,
-    },
-    "Issue deadline expired after 24 hours",
-    {
-      env: { GH_TOKEN: "test-token" },
-      fetchImpl: async (url, options) => {
-        requests.push({ url: String(url), options });
-        return { ok: true, status: 201 };
+  const originalTimeout = AbortSignal.timeout;
+  const timeoutController = new AbortController();
+  let timeoutMs;
+  AbortSignal.timeout = (milliseconds) => {
+    timeoutMs = milliseconds;
+    return timeoutController.signal;
+  };
+  try {
+    await postIssueFailureComment(
+      {
+        repository: "daiksud/test-codex",
+        number: 19,
       },
-    },
-  );
+      "Issue deadline expired after 24 hours",
+      {
+        env: { GH_TOKEN: "test-token" },
+        fetchImpl: async (url, options) => {
+          requests.push({ url: String(url), options });
+          return { ok: true, status: 201 };
+        },
+      },
+    );
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+  }
+
+  assert.equal(timeoutMs, 5000, "best-effort reporting needs a bounded timeout");
+  assert.equal(requests[0].options.signal, timeoutController.signal);
 
   assert.equal(
     requests[0].url,
@@ -597,6 +616,28 @@ test("deadline comments use the Issue REST endpoint and scoped GitHub token", as
   assert.deepEqual(JSON.parse(requests[0].options.body), {
     body: "Codex automation failed: Issue deadline expired after 24 hours.",
   });
+});
+
+test("deadline reporting propagates cancellation to a pending API request", async () => {
+  const controller = new AbortController();
+  const timeoutError = new Error("failure-report timeout");
+  const report = issueFlow.postIssueFailureComment(
+    { repository: "daiksud/test-codex", number: 19 },
+    "Issue deadline expired after 24 hours",
+    {
+      env: { GH_TOKEN: "test-token" },
+      signal: controller.signal,
+      fetchImpl: async (url, options) => {
+        assert.equal(options.signal, controller.signal, "report cancellation must reach fetch");
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+        });
+      },
+    },
+  );
+  const failure = assert.rejects(report, (error) => error === timeoutError);
+  controller.abort(timeoutError);
+  await failure;
 });
 
 test("deadline comment does not make a request without a GitHub token", async () => {

@@ -362,7 +362,7 @@ export async function runIssuePlanJob({
 export async function postIssueFailureComment(
   issue,
   reason,
-  { env = process.env, fetchImpl = globalThis.fetch } = {},
+  { env = process.env, fetchImpl = globalThis.fetch, signal } = {},
 ) {
   const token = env.GH_TOKEN;
   if (typeof token !== "string" || token.length === 0) {
@@ -383,6 +383,7 @@ export async function postIssueFailureComment(
   );
   const response = await fetchImpl(endpoint, {
     method: "POST",
+    signal: signal ?? AbortSignal.timeout(5000),
     headers: {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
@@ -414,6 +415,8 @@ export async function runIssuePlanCli({
     );
     await Promise.race([session.deadline.expiration, session.client.failure]);
   } catch (error) {
+    setExitCode(1);
+    writeStderr(`Codex Issue session failed: ${error.message}\n`);
     if (session && !session.deadline.expired) {
       session.deadline.cancel();
       session.client.close();
@@ -428,8 +431,6 @@ export async function runIssuePlanCli({
         );
       }
     }
-    writeStderr(`Codex Issue session failed: ${error.message}\n`);
-    setExitCode(1);
   }
 }
 
