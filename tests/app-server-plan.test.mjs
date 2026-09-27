@@ -598,3 +598,31 @@ test("fails a Plan turn that emits a file change or an empty plan", async () => 
     /Plan turn completed without a concrete plan/,
   );
 });
+
+for (const method of ["mcpServerStatus/list", "model/list"]) {
+  for (const cursors of [[""], ["A", "A"], ["A", "B", "A"]]) {
+    test(`${method} rejects malformed pagination ${JSON.stringify(cursors)} before another request or Plan`, async () => {
+      const client = new FakeAppServer();
+      const original = client.request.bind(client);
+      let count = 0;
+      client.request = async (name, params) => {
+        if (name !== method) return original(name, params);
+        client.requests.push({ method: name, params });
+        count += 1;
+        if (count > cursors.length) throw new Error("Fixture page request limit");
+        return { data: [], nextCursor: cursors[count - 1] };
+      };
+      await assert.rejects(startIssuePlanTurn(client, { workspace, issue }), /invalid.*cursor/i);
+      assert.equal(count, cursors.length);
+      assert.equal(client.requests.some(request => request.method === "thread/start"), false);
+      assert.equal(client.requests.some(request => request.method === "turn/start"), false);
+    });
+  }
+}
+
+test("omitted app-server list cursors terminate pagination normally", async () => {
+  const client = new FakeAppServer({ mcpPages: [{ data: [] }], modelPages: [{ data: [{ id: "gpt-6-sol", isDefault: true, hidden: false }] }] });
+  assert.equal((await startIssuePlanTurn(client, { workspace, issue })).plan, planText);
+  assert.equal(client.requests.filter(request => request.method === "mcpServerStatus/list").length, 1);
+  assert.equal(client.requests.filter(request => request.method === "model/list").length, 1);
+});

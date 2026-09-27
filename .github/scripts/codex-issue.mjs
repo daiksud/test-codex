@@ -1485,6 +1485,7 @@ export async function readIssueImplementationTurn(session, turnId) {
 
 async function listAll(client, method, params) {
   const results = [];
+  const seenCursors = new Set();
   let cursor = null;
 
   do {
@@ -1499,10 +1500,11 @@ async function listAll(client, method, params) {
     const nextCursor = page.nextCursor ?? null;
     if (
       nextCursor !== null &&
-      typeof nextCursor !== "string"
+      (typeof nextCursor !== "string" || !nextCursor || seenCursors.has(nextCursor))
     ) {
       throw new Error(`Codex app-server returned an invalid ${method} cursor`);
     }
+    if (nextCursor !== null) seenCursors.add(nextCursor);
     cursor = nextCursor;
   } while (cursor !== null);
 
