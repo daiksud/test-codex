@@ -20,6 +20,13 @@ const DELIVERY_REPORT_SCHEMA = {
   required: ["status", "pullRequestNumber", "localBranch", "localMainSha", "clean", "todo", "botReviewComplete", "reason"],
 };
 
+const issueDeliveryFindings = new WeakSet();
+function issueDeliveryFinding(message) {
+  const error = Object.assign(new Error(message), { code: "ISSUE_DELIVERY_FINDING" });
+  issueDeliveryFindings.add(error);
+  return error;
+}
+
 export async function createCodexAppServer({
   workspace, signal, executeFile = promisify(execFile), spawnProcess = spawnChild,
 }) {
@@ -723,6 +730,7 @@ export async function observeIssueDelivery(handoff, {
       return { turn, report, remoteEvidence };
     } catch (error) {
       if (session.deadline.expired) throw session.deadline.error;
+      if (issueDeliveryFindings.has(error)) return { turn, report, finding: error, remoteEvidence: null };
       if (error.retryable !== true) throw error;
       const fallback = Math.min(60000, 1000 * 2 ** transientFailures++);
       const delayMs = error.delayMs ?? fallback;
@@ -880,6 +888,28 @@ export async function retryIssueImplementation(handoff, outcome, {
   return startAuthorizedIssueTurn(session, profile, prompt);
 }
 
+export async function continueIssueAfterFinding(handoff, outcome) {
+  const report = parseIssueDeliveryReport(outcome?.turn);
+  if (report.status !== "complete" || !issueDeliveryFindings.has(outcome?.finding)) {
+    throw new Error("A qualified complete report and recognized remote finding are required");
+  }
+  const { session, approval, receipt } = handoff;
+  const { client, deadline, issue } = session;
+  if (deadline.expired) throw deadline.error;
+  requireApprovedIssueReceipt(session, approval, receipt);
+  const profile = client.implementationProfile;
+  if (typeof profile !== "string" || !profile.startsWith("codex_issue_workspace_")) {
+    throw new Error("The owned workspace implementation profile is required");
+  }
+  const prompt = [
+    `Continue Issue ${issue.url} in this same session. Your last report claimed completion, but an observed remote condition remains incomplete. Add the finding below to ToDo, inspect and investigate it, then fix valid issues or wait for CI/bot results while self-reviewing. Do not weaken repository protections or silently discard the finding.`,
+    ...issueResumeInstructions(issue, receipt),
+    `Observed remote finding / ToDo: ${outcome.finding.message}`,
+    `Approved Plan (verbatim):\n${receipt.approvedPlan}`,
+  ].join("\n\n");
+  return startAuthorizedIssueTurn(session, profile, prompt);
+}
+
 export function parseIssueDeliveryReport(result) {
   if (result?.status !== "completed") throw new Error("Implementation turn must be completed before reading a delivery report");
   let report;
@@ -937,18 +967,20 @@ export async function reconcileIssueDelivery(session, report, options = {}) {
   const get = createIssueGitHubReader(session, options);
   const root = `https://api.github.com/repos/${repository}`;
   const remoteIssue = await get(`${root}/issues/${issueNumber}`);
-  if (remoteIssue?.number !== issueNumber || remoteIssue.state !== "closed") {
-    throw new Error("Target Issue is not closed");
+  if (remoteIssue?.number !== issueNumber || !["open", "closed"].includes(remoteIssue.state)) {
+    throw new Error("Invalid target Issue identity or state");
   }
+  if (remoteIssue.state === "open") throw issueDeliveryFinding("Target Issue is not closed");
   const pullRequestNumber = qualified.pullRequestNumber;
   const prUrl = `${root}/pulls/${pullRequestNumber}`;
   const pr = await get(prUrl);
-  if (pr?.number !== pullRequestNumber || pr.merged !== true ||
+  if (pr?.number !== pullRequestNumber || typeof pr.merged !== "boolean" ||
       pr.base?.ref !== "main" || pr.base?.repo?.full_name !== repository ||
       pr.head?.repo?.full_name !== repository || pr.head?.ref !== `codex/issue-${issueNumber}` ||
       !/^[a-f0-9]{40}$/i.test(pr.head?.sha ?? "")) {
     throw new Error("PR repository, merge, base branch or head evidence does not match this Issue");
   }
+  if (!pr.merged) throw issueDeliveryFinding("PR is not merged");
   let linked = false;
   for (let page = 1; ; page += 1) {
     const events = await get(`${root}/issues/${issueNumber}/timeline?per_page=100&page=${page}`);
@@ -959,11 +991,12 @@ export async function reconcileIssueDelivery(session, report, options = {}) {
       event.source.issue.pull_request?.url === prUrl);
     if (linked || events.length < 100) break;
   }
-  if (!linked) throw new Error("Merged PR has no matching Issue cross-reference link");
+  if (!linked) throw issueDeliveryFinding("Merged PR has no matching Issue cross-reference link");
   const main = await get(`${root}/git/ref/heads/main`);
-  if (main?.ref !== "refs/heads/main" || main.object?.sha !== qualified.localMainSha) {
-    throw new Error("Reported local main does not match remote main");
+  if (main?.ref !== "refs/heads/main" || !/^[a-f0-9]{40}$/i.test(main.object?.sha ?? "")) {
+    throw new Error("Invalid remote main ref or SHA");
   }
+  if (main.object.sha !== qualified.localMainSha) throw issueDeliveryFinding("Reported local main does not match remote main");
   return { repository, issueNumber, pullRequestNumber, headSha: pr.head.sha, mainSha: main.object.sha };
 }
 
@@ -997,8 +1030,11 @@ export async function verifyIssueRequiredCi(session, facts, options = {}) {
     latestStatus ??= statuses.find(status => status?.context === context) ?? null;
     if (statuses.length < 100) break;
   }
-  if (latestStatus && (latestStatus.url !== `${root}/statuses/${headSha}` || latestStatus.state !== "success")) {
-    throw new Error("Required CI status is not successful on the exact PR head");
+  if (latestStatus) {
+    if (latestStatus.url !== `${root}/statuses/${headSha}` || !["success", "pending", "failure", "error"].includes(latestStatus.state)) {
+      throw new Error("Invalid CI status identity or state");
+    }
+    if (latestStatus.state !== "success") throw issueDeliveryFinding("Required CI status is not successful on the exact PR head");
   }
   let hasCheck = false;
   for (let page = 1; ; page += 1) {
@@ -1006,14 +1042,19 @@ export async function verifyIssueRequiredCi(session, facts, options = {}) {
     if (!Array.isArray(response?.check_runs)) throw new Error("Invalid CI check-run evidence");
     for (const check of response.check_runs.filter(check => check?.name === context)) {
       hasCheck = true;
-      if (check.head_sha !== headSha || check.status !== "completed" ||
-          !["success", "skipped", "neutral"].includes(check.conclusion)) {
-        throw new Error("Required CI check is not successful on the exact PR head");
+      if (check.head_sha !== headSha || !["queued", "in_progress", "completed", "waiting", "requested", "pending"].includes(check.status)) {
+        throw new Error("Invalid CI check identity or state");
+      }
+      if (check.status === "completed" && !["action_required", "cancelled", "failure", "neutral", "success", "skipped", "stale", "timed_out"].includes(check.conclusion)) {
+        throw new Error("Invalid completed CI check conclusion");
+      }
+      if (check.status !== "completed" || !["success", "skipped", "neutral"].includes(check.conclusion)) {
+        throw issueDeliveryFinding("Required CI check is not successful on the exact PR head");
       }
     }
     if (response.check_runs.length < 100) break;
   }
-  if (!latestStatus && !hasCheck) throw new Error("Missing required CI evidence");
+  if (!latestStatus && !hasCheck) throw issueDeliveryFinding("Missing required CI evidence");
   return { headSha, requiredContext: context };
 }
 
@@ -1059,7 +1100,7 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
     cursor = page(requests, requestCursors);
     for (const request of requests.nodes) {
       if (typeof request?.requestedReviewer?.__typename !== "string") throw new Error("Invalid requested reviewer");
-      if (request.requestedReviewer.__typename === "Bot") throw new Error("Bot review request is still pending");
+      if (request.requestedReviewer.__typename === "Bot") throw issueDeliveryFinding("Bot review request is still pending");
     }
   } while (cursor !== null);
   const latestReviews = new Map();
@@ -1069,6 +1110,10 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
     for (const review of reviews) {
       if (typeof review?.user?.type !== "string") throw new Error("Invalid review author");
       if (review.user.type === "Bot") {
+        if (!/^[a-f0-9]{40}$/i.test(review.commit_id ?? "") ||
+            !["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"].includes(review.state)) {
+          throw new Error("Invalid Bot review commit or state");
+        }
         const login = botLogin(review.user.login);
         participants.add(login);
         latestReviews.set(login, review);
@@ -1085,7 +1130,7 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
         if (typeof comment?.author?.__typename !== "string") throw new Error("Invalid review comment author");
         if (comment.author.__typename === "Bot") {
           participants.add(botLogin(comment.author.login));
-          if (!thread.isResolved) throw new Error("Unresolved Bot review thread remains");
+          if (!thread.isResolved) throw issueDeliveryFinding("Unresolved Bot review thread remains");
         }
       }
       if (nextCursor === null) break;
@@ -1111,7 +1156,7 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
     const review = latestReviews.get(login);
     if (!review || review.commit_id !== facts.headSha || !["COMMENTED", "APPROVED"].includes(review.state) ||
         typeof review.submitted_at !== "string" || !review.submitted_at) {
-      throw new Error("Bot has no completed review on the latest PR head");
+      throw issueDeliveryFinding("Bot has no completed review on the latest PR head");
     }
   }
   return { headSha: facts.headSha, bots: [...participants].sort() };
