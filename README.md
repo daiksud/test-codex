@@ -76,7 +76,7 @@ merge 後の照合では、使用する CI 証拠の時刻も確認する。stat
 現在の head の review が未完了なら `@codex review` と head SHA の marker を PR コメントに書き、同じ marker の既存 request は再利用する。
 submitted かつ現在の head の `COMMENTED` / `APPROVED` formal review、
 または `github-actions[bot]` によるその request に付いた connector の新しい 👍 を完了の証拠にする。[^github-review]
-実際に観測した connector の「Codex Review: Didn't find any major issues. Nice work!」PR コメントも、
+実際に観測した connector の「Codex Review: Didn't find any major issues.」で始まる PR コメントも、
 現在の head の Reviewed commit marker と、先行する同じ Actions request・正しい URL・時刻を確認して完了の証拠にする。
 レビューの完了、request の投稿・編集、reaction または指摘なしコメントの時刻が merge より後なら完了にしない。
 `COMMENTED` は、実際の Codex Review と対象 commit の marker を持つ review body を確認する。一般の task reply や環境作成案内の `COMMENTED` record はコードレビューの証拠にしない。
