@@ -14,6 +14,8 @@ sources:
     resource: https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow
   - id: github-queue
     resource: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idconcurrency
+  - id: github-review
+    resource: https://learn.chatgpt.com/docs/third-party/github
 ---
 
 ## test-codex
@@ -64,8 +66,15 @@ Codex の完了報告だけで成功にせず、Plan コメント、Issue、merg
 `GITHUB_TOKEN` の push は push workflow を起動しない。[^github-trigger]
 そのため Codex は毎回の正確な PR head で repository checks を実行し、Actions run URL 付きの
 `Codex verification` commit status を pending → success に更新する。
+status の作成者が `github-actions[bot]`、`target_url` が session に保持した今回の Actions run URL と一致することも確認する。
 人間の追加 workflow 承認は要求しない。`GH_TOKEN` は job の write token で、
 `github-actions[bot]` としての書き込みはこの処理で意図したもの。
+
+この repository で確認した Codex review integration の `chatgpt-codex-connector` の証拠を controller の完了条件にする。
+現在の head の review が未完了なら `@codex review` と head SHA の marker を PR コメントに書き、同じ marker の既存 request は再利用する。
+submitted かつ現在の head の `COMMENTED` / `APPROVED` formal review、またはその request に付いた connector の新しい 👍 を完了の証拠にする。[^github-review]
+現在の head の `CHANGES_REQUESTED` / `PENDING` / `DISMISSED` review は未完了として扱う。
+空の bot 集合や古い head の反応では完了にしない。未解決 thread は残せず、Actions writer 自身を external reviewer には数えない。
 
 期限は **Issue 作成から24時間**で、queue 待機も含む。
 一時障害は期限内で retry し、結果不明の投稿は先に remote 状態を確認する。
@@ -90,6 +99,7 @@ actionlint 1.7.12 は `queue: max` を知らないため、そのキーの診断
 20秒で `connecting` → `errored`、HTTP 409 の retry が7回あり、`connected` は観測できなかった。
 原因は未確定。所有 process は終了済み。Remote の接続、ChatGPT の Plan 表示・承認、
 UI が開始する turn の read-only 継承は実機での確認が必要。
+`github-actions[bot]` が投稿した review trigger を connector が処理するか、指摘なしの 👍 がその request に付くかも未検証。
 
 API の模擬承認・loopback session 継続・ローカル Git fixture は、ChatGPT アプリの承認の証拠ではない。
 Mac mini の job、author guard、実際の write token、直接 main push の拒否、CI・bot 修正と merge、
@@ -102,3 +112,4 @@ workflow が main に入った後の新規 Issue が起点になる。既存 Iss
 [^github-queue]: GitHub Actions の job concurrency と queue の上限・待機順。
 [^cli-remote]: 検証した Codex 0.156.1 の CLI source。`--remote-control` は `EnabledEphemeral` に対応する。
 [^github-trigger]: GitHub の GITHUB_TOKEN による event と workflow 起動の規則。
+[^github-review]: OpenAI の GitHub review 設定と `@codex review`・指摘なしの反応の説明。
