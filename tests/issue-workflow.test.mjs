@@ -75,6 +75,19 @@ test("Codex starts from a clean main checkout in the default workspace", () => {
   assert.match(run, /^  run:\n    shell: bash$/m);
 });
 
+test("the self-hosted job provisions Node 24 before invoking the Plan CLI", () => {
+  const jobs = blockAtIndent(workflow, 0, "jobs");
+  const processingJob = blockAtIndent(jobs, 2, "codex");
+  const steps = blockAtIndent(processingJob, 4, "steps").split(/^      - /m).slice(1);
+
+  assert.equal(steps.length, 3);
+  assert.match(steps[0], /^uses: actions\/checkout@d23441a48e516b6c34aea4fa41551a30e30af803/);
+  assert.match(steps[1], /^uses: actions\/setup-node@820762786026740c76f36085b0efc47a31fe5020/);
+  assert.match(steps[1], /with:\n          node-version: 24\n          package-manager-cache: false/);
+  assert.doesNotMatch(steps[1], /^\s+cache:/m);
+  assert.match(steps[2], /^name: Start Codex Plan\n        run: node /);
+});
+
 test("the guarded job launches the Plan CLI with scoped write permissions", () => {
   const jobs = blockAtIndent(workflow, 0, "jobs");
   const processingJob = blockAtIndent(jobs, 2, "codex");

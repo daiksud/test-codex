@@ -28,6 +28,10 @@ jobs:
           ref: main
           clean: true
           persist-credentials: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
       - name: Start Codex Plan
         run: node .github/scripts/codex-issue.mjs
         env:
