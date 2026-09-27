@@ -767,14 +767,10 @@ export function parseIssueDeliveryReport(result) {
   return report;
 }
 
-export async function reconcileIssueDelivery(session, report, options = {}) {
-  const qualified = parseIssueDeliveryReport({ status: "completed", text: JSON.stringify(report) });
-  if (qualified.status !== "complete") throw new Error("A qualified complete delivery report is required");
-  const { client, deadline, issue } = session;
-  const { repository, number: issueNumber } = issue;
+function createIssueGitHubReader(session, options) {
+  const { client, deadline } = session;
   const { request, bounded, lifetime } = createIssueGitHubRequests(session, options);
   const waitBeforeRetry = options.waitBeforeRetry ?? waitForIssueRetry;
-  const root = `https://api.github.com/repos/${repository}`;
   async function get(url) {
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
@@ -787,6 +783,16 @@ export async function reconcileIssueDelivery(session, report, options = {}) {
       }
     }
   }
+  return get;
+}
+
+export async function reconcileIssueDelivery(session, report, options = {}) {
+  const qualified = parseIssueDeliveryReport({ status: "completed", text: JSON.stringify(report) });
+  if (qualified.status !== "complete") throw new Error("A qualified complete delivery report is required");
+  const { issue } = session;
+  const { repository, number: issueNumber } = issue;
+  const get = createIssueGitHubReader(session, options);
+  const root = `https://api.github.com/repos/${repository}`;
   const remoteIssue = await get(`${root}/issues/${issueNumber}`);
   if (remoteIssue?.number !== issueNumber || remoteIssue.state !== "closed") {
     throw new Error("Target Issue is not closed");
@@ -816,6 +822,56 @@ export async function reconcileIssueDelivery(session, report, options = {}) {
     throw new Error("Reported local main does not match remote main");
   }
   return { repository, issueNumber, pullRequestNumber, headSha: pr.head.sha, mainSha: main.object.sha };
+}
+
+export async function verifyIssueRequiredCi(session, facts, options = {}) {
+  const { issue } = session;
+  if (facts?.repository !== issue.repository || facts.issueNumber !== issue.number ||
+      !Number.isSafeInteger(facts.pullRequestNumber) || facts.pullRequestNumber <= 0 ||
+      !/^[a-f0-9]{40}$/i.test(facts.headSha ?? "")) {
+    throw new Error("CI facts must match this Issue and a valid PR head");
+  }
+  const get = createIssueGitHubReader(session, options);
+  const root = `https://api.github.com/repos/${issue.repository}`;
+  const rules = await get(`${root}/rules/branches/main`);
+  if (!Array.isArray(rules) || rules.some(rule => rule?.type === "workflows")) {
+    throw new Error("Unexpected effective required CI rules");
+  }
+  const policies = rules.filter(rule => rule?.type === "required_status_checks");
+  const policy = policies[0]?.parameters;
+  const required = policy?.required_status_checks;
+  const context = "Codex verification";
+  if (policies.length !== 1 || policy.strict_required_status_checks_policy !== false ||
+      !Array.isArray(required) || required.length !== 1 || required[0]?.context !== context ||
+      required[0].integration_id != null) {
+    throw new Error("Effective required CI policy or app binding changed");
+  }
+  const { headSha } = facts;
+  let latestStatus = null;
+  for (let page = 1; ; page += 1) {
+    const statuses = await get(`${root}/commits/${headSha}/statuses?per_page=100&page=${page}`);
+    if (!Array.isArray(statuses)) throw new Error("Invalid CI status evidence");
+    latestStatus ??= statuses.find(status => status?.context === context) ?? null;
+    if (statuses.length < 100) break;
+  }
+  if (latestStatus && (latestStatus.url !== `${root}/statuses/${headSha}` || latestStatus.state !== "success")) {
+    throw new Error("Required CI status is not successful on the exact PR head");
+  }
+  let hasCheck = false;
+  for (let page = 1; ; page += 1) {
+    const response = await get(`${root}/commits/${headSha}/check-runs?filter=latest&per_page=100&page=${page}`);
+    if (!Array.isArray(response?.check_runs)) throw new Error("Invalid CI check-run evidence");
+    for (const check of response.check_runs.filter(check => check?.name === context)) {
+      hasCheck = true;
+      if (check.head_sha !== headSha || check.status !== "completed" ||
+          !["success", "skipped", "neutral"].includes(check.conclusion)) {
+        throw new Error("Required CI check is not successful on the exact PR head");
+      }
+    }
+    if (response.check_runs.length < 100) break;
+  }
+  if (!latestStatus && !hasCheck) throw new Error("Missing required CI evidence");
+  return { headSha, requiredContext: context };
 }
 
 function issuePlanPrompt(issue) {

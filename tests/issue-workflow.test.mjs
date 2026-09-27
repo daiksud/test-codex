@@ -86,6 +86,7 @@ test("the guarded job launches the Plan CLI with scoped write permissions", () =
     .filter((line) => line.startsWith("      "))
     .map((line) => line.trim());
   assert.deepEqual(permissionEntries, [
+    "checks: read",
     "contents: write",
     "issues: write",
     "pull-requests: write",
