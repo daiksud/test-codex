@@ -63,6 +63,13 @@ export function spawnCodexAppServer({ workspace, spawnProcess = spawnChild }) {
 
   function receiveMessage(message) {
     if (message && typeof message.method === "string") {
+      if (Object.hasOwn(message, "id")) {
+        fail(new Error(
+          `Codex app-server request ${message.method} requires a client response; ` +
+            "this unattended client cannot answer it",
+        ));
+        return;
+      }
       queueEvent(message);
       return;
     }

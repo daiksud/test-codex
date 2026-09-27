@@ -192,3 +192,22 @@ test("deliberate client close does not signal an unexpected failure", async () =
   await setImmediate();
   assert.equal(unexpectedFailure, false);
 });
+
+for (const id of [0, "question-1"]) {
+  test(`rejects an unsupported server request with id ${id}`, async () => {
+    const fake = fakeSpawner();
+    const client = issueFlow.spawnCodexAppServer({ workspace, spawnProcess: fake.spawnProcess });
+    const nextEvent = client.nextEvent();
+    try {
+      fake.children[0].stdout.write(`${JSON.stringify({
+        id,
+        method: "item/tool/requestUserInput",
+        params: { threadId: "thread-1", turnId: "turn-1" },
+      })}\n`);
+      await assert.rejects(nextEvent, /item\/tool\/requestUserInput.*requires a client response/);
+      assert.equal(fake.children[0].stdinWrites.length, 0);
+    } finally {
+      client.close();
+    }
+  });
+}
