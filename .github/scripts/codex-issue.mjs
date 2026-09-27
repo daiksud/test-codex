@@ -380,6 +380,7 @@ export async function startIssuePlanSession({
       issue,
       client,
       deadline,
+      signal: preparation.signal,
       ...plan,
     };
   } catch (error) {
@@ -526,6 +527,124 @@ export async function waitForIssuePlanApproval(session) {
   }
 }
 
+export async function postApprovedIssuePlan(session, approval, {
+  env = process.env, fetchImpl = globalThis.fetch, now = Date.now,
+  waitBeforeRetry = waitForIssueRetry,
+} = {}) {
+  const { issue, threadId, client, deadline } = session;
+  if (deadline.expired) throw deadline.error;
+  const token = env.GH_TOKEN ?? env.GITHUB_TOKEN;
+  if (typeof token !== "string" || !token.trim()) throw new Error("GitHub token is required");
+  if (!(session.signal instanceof AbortSignal)) throw new Error("Issue cancellation signal is required");
+  if (typeof threadId !== "string" || !threadId ||
+      typeof approval?.approvalTurnId !== "string" || !approval.approvalTurnId ||
+      typeof approval.approvedPlan !== "string" || !approval.approvedPlan.trim()) {
+    throw new Error("A captured nonempty approved Plan is required");
+  }
+  const stopApi = new AbortController();
+  client.failure.catch(error => stopApi.abort(error));
+  const lifetime = AbortSignal.any([session.signal, stopApi.signal]);
+  const body = `<!-- codex-approved-plan:${threadId}:${approval.approvalTurnId} -->\n` +
+    `## Approved Codex Plan\n\n${approval.approvedPlan}`;
+  const endpoint = `https://api.github.com/repos/${issue.repository}/issues/${issue.number}/comments`;
+  const headers = {
+    Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json", "X-GitHub-Api-Version": "2026-03-10",
+  };
+  async function bounded(operation) {
+    if (deadline.expired) throw deadline.error;
+    lifetime.throwIfAborted();
+    const result = await Promise.race([
+      deadline.expiration, client.failure, operation(),
+    ]);
+    if (deadline.expired) throw deadline.error;
+    lifetime.throwIfAborted();
+    return result;
+  }
+  function retryDelay(response, rateLimited) {
+    const retryAfter = response.headers.get("retry-after")?.trim();
+    if (retryAfter) {
+      const delay = /^\d+(\.\d+)?$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - now();
+      if (Number.isFinite(delay)) return Math.max(0, delay);
+    }
+    if (response.headers.get("x-ratelimit-remaining") === "0") {
+      const reset = response.headers.get("x-ratelimit-reset");
+      if (reset !== null && Number.isFinite(Number(reset))) return Math.max(0, Number(reset) * 1000 - now());
+    }
+    return rateLimited ? 60000 : null;
+  }
+  async function request(url, method, payload) {
+    const signal = AbortSignal.any([lifetime, AbortSignal.timeout(5000)]);
+    let response;
+    let data;
+    try {
+      response = await bounded(() => fetchImpl(url, {
+        method, headers, signal, ...(payload ? { body: JSON.stringify(payload) } : {}),
+      }));
+      try {
+        data = await bounded(() => response.json());
+      } catch (error) {
+        if (deadline.expired) throw deadline.error;
+        lifetime.throwIfAborted();
+        if (response.ok) throw error;
+        // HTTP status and retry headers remain usable without an error body.
+        data = null;
+      }
+    } catch (error) {
+      if (deadline.expired) throw deadline.error;
+      lifetime.throwIfAborted();
+      if (error instanceof TypeError || ["AbortError", "TimeoutError"].includes(error.name)) {
+        throw Object.assign(new Error("GitHub approved Plan request failed"), { retryable: true });
+      }
+      if (error instanceof SyntaxError) throw new Error("Invalid GitHub Plan API response");
+      throw error;
+    }
+    if (!response.ok) {
+      const rateLimited = response.status === 429 || (response.status === 403 && (
+        response.headers.has("retry-after") || response.headers.get("x-ratelimit-remaining") === "0" ||
+        /rate[ -]limit/i.test(typeof data?.message === "string" ? data.message : "")
+      ));
+      throw Object.assign(new Error(`GitHub approved Plan request failed with HTTP ${response.status}`), {
+        retryable: rateLimited || response.status === 408 || (response.status >= 500 && response.status < 600),
+        delayMs: retryDelay(response, rateLimited),
+      });
+    }
+    return data;
+  }
+  function result(comment) {
+    if (!Number.isSafeInteger(comment?.id) || comment.id <= 0 || comment.body !== body ||
+        comment.user?.login !== "github-actions[bot]" ||
+        comment.html_url !== `https://github.com/${issue.repository}/issues/${issue.number}#issuecomment-${comment.id}`) {
+      throw new Error("Invalid GitHub approved Plan comment response");
+    }
+    return { id: comment.id, url: comment.html_url };
+  }
+  let uncertainPost = false;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    let inspected = false;
+    let posted = false;
+    try {
+      for (let page = 1; ; page += 1) {
+        const comments = await request(`${endpoint}?per_page=100&page=${page}`, "GET");
+        if (!Array.isArray(comments)) throw new Error("Cannot inspect GitHub Plan comments response");
+        const existing = comments.find(comment => comment?.body === body && comment.user?.login === "github-actions[bot]");
+        if (existing) return result(existing);
+        if (comments.length < 100) break;
+      }
+      inspected = true;
+      uncertainPost = false;
+      posted = true;
+      return result(await request(endpoint, "POST", { body }));
+    } catch (error) {
+      if (deadline.expired) throw deadline.error;
+      lifetime.throwIfAborted();
+      if ((!inspected && uncertainPost) || !error.retryable || attempt === 3) throw error;
+      if (posted) uncertainPost = true;
+      await bounded(() => waitBeforeRetry(error.delayMs ?? 1000 * 2 ** (attempt - 1), { client, deadline }));
+    }
+  }
+}
+
 function issuePlanPrompt(issue) {
   return [
     `Plan the work described in GitHub Issue #${issue.number}: ${issue.title}`,
@@ -602,7 +721,7 @@ function isTransientPlanError(info) {
   return false;
 }
 
-async function waitForPlanRetry(delayMs, { client, deadline }) {
+async function waitForIssueRetry(delayMs, { client, deadline }) {
   let timer;
   try {
     await Promise.race([
@@ -637,7 +756,7 @@ async function readPlanTurnResult(client, threadId, turnId) {
 }
 
 export async function startIssuePlanTurn(client, {
-  workspace, issue, deadline, waitBeforeRetry = waitForPlanRetry,
+  workspace, issue, deadline, waitBeforeRetry = waitForIssueRetry,
 }) {
   await client.request("initialize", {
     clientInfo: {

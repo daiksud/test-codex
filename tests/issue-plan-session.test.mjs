@@ -204,6 +204,7 @@ test("starts one Plan session from the GitHub issue event and retains its client
   assert.equal(session.status, "started");
   assert.equal(session.remainingMs, 24 * 60 * 60 * 1000);
   assert.equal(session.client, client);
+  assert.equal(session.signal, createdClients[0].signal);
   assert.equal(session.threadId, "thread-19");
   assert.equal(session.turnId, "turn-plan");
   assert.equal(session.plan, planText);
