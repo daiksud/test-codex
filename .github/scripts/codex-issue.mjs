@@ -7,6 +7,18 @@ import { promisify } from "node:util";
 
 export const MAX_ISSUE_RUNTIME_MS = 24 * 60 * 60 * 1000;
 const MAX_PLAN_ATTEMPTS = 3;
+const DELIVERY_REPORT_SCHEMA = {
+  type: "object", additionalProperties: false,
+  properties: {
+    status: { type: "string", enum: ["pending", "complete", "failed"] },
+    pullRequestNumber: { type: ["integer", "null"] },
+    localBranch: { type: ["string", "null"] },
+    localMainSha: { type: ["string", "null"] },
+    clean: { type: "boolean" }, todo: { type: "array", items: { type: "string" } },
+    botReviewComplete: { type: "boolean" }, reason: { type: "string" },
+  },
+  required: ["status", "pullRequestNumber", "localBranch", "localMainSha", "clean", "todo", "botReviewComplete", "reason"],
+};
 
 export async function createCodexAppServer({
   workspace, signal, executeFile = promisify(execFile), spawnProcess = spawnChild,
@@ -684,6 +696,7 @@ export async function startApprovedIssueImplementation(session, approval, receip
     "Merge only when all required CI is successful, bot review is complete, every actionable finding is resolved, and ToDo is empty. Resolve conflicts without weakening repository protections; squash merge through the PR.",
     "After merge, return to main, fetch and sync with remote, delete the local working branch, and verify a clean working tree. Verify the Issue is closed and do not carry this Issue's state into the next one.",
     "Automatically retry transient network/API/CI/review/service failures within the original 24-hour deadline. Inspect remote state before retrying a mutation with an unknown outcome; investigate and fix code/test/review failures instead of blindly retrying them. On failure, record its reason when possible and perform cleanup yourself.",
+    "Return the constrained JSON delivery report. Use status complete only after every delivery and cleanup condition is verified. Otherwise report pending with remaining ToDo, or failed with the reason; a final message alone does not establish completion. localMainSha is the actual local main commit SHA after cleanup.",
     `Title: ${issue.title}\nIssue body:\n${issue.body}`,
     `Approved Plan (verbatim):\n${receipt.approvedPlan}`,
   ].join("\n\n");
@@ -700,6 +713,7 @@ export async function startApprovedIssueImplementation(session, approval, receip
   }
   const started = await bounded(() => client.request("turn/start", {
     threadId, cwd: workspace, permissions: profile, approvalPolicy: "never",
+    outputSchema: DELIVERY_REPORT_SCHEMA,
     collaborationMode: {
       mode: "default", settings: {
         model: thread.model, reasoning_effort: thread.reasoningEffort ?? null,
@@ -712,6 +726,36 @@ export async function startApprovedIssueImplementation(session, approval, receip
     throw new Error("Codex app-server did not return an implementation turn ID");
   }
   return started.turn.id;
+}
+
+export function parseIssueDeliveryReport(result) {
+  if (result?.status !== "completed") throw new Error("Implementation turn must be completed before reading a delivery report");
+  let report;
+  try {
+    report = JSON.parse(result.text);
+  } catch {
+    throw new Error("Invalid delivery report JSON");
+  }
+  const fields = DELIVERY_REPORT_SCHEMA.required;
+  if (!report || typeof report !== "object" || Array.isArray(report) ||
+      Object.keys(report).length !== fields.length || fields.some(field => !Object.hasOwn(report, field)) ||
+      !["pending", "complete", "failed"].includes(report.status) ||
+      !(report.pullRequestNumber === null || Number.isInteger(report.pullRequestNumber)) ||
+      !(report.localBranch === null || typeof report.localBranch === "string") ||
+      !(report.localMainSha === null || typeof report.localMainSha === "string") ||
+      typeof report.clean !== "boolean" || typeof report.botReviewComplete !== "boolean" ||
+      typeof report.reason !== "string" || !Array.isArray(report.todo) ||
+      report.todo.some(item => typeof item !== "string")) {
+    throw new Error("Delivery report does not match the output schema");
+  }
+  if (report.status === "complete" && (
+    !Number.isSafeInteger(report.pullRequestNumber) || report.pullRequestNumber <= 0 ||
+    report.localBranch !== "main" || !/^[a-f0-9]{40}$/i.test(report.localMainSha ?? "") ||
+    !report.clean || !report.botReviewComplete || report.todo.length > 0
+  )) {
+    throw new Error("Delivery report claims complete without every completion condition");
+  }
+  return report;
 }
 
 function issuePlanPrompt(issue) {

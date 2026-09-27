@@ -61,6 +61,18 @@ test("starts the same thread with its owned workspace profile and current model"
   assert.deepEqual(params.collaborationMode, {
     mode: "default", settings: { model: "gpt-6-sol", reasoning_effort: "high", developer_instructions: null },
   });
+  assert.deepEqual(params.outputSchema, {
+    type: "object", additionalProperties: false,
+    properties: {
+      status: { type: "string", enum: ["pending", "complete", "failed"] },
+      pullRequestNumber: { type: ["integer", "null"] },
+      localBranch: { type: ["string", "null"] },
+      localMainSha: { type: ["string", "null"] },
+      clean: { type: "boolean" }, todo: { type: "array", items: { type: "string" } },
+      botReviewComplete: { type: "boolean" }, reason: { type: "string" },
+    },
+    required: ["status", "pullRequestNumber", "localBranch", "localMainSha", "clean", "todo", "botReviewComplete", "reason"],
+  });
   const prompt = params.input[0].text;
   assert.ok(prompt.includes(issue.url) && prompt.includes(issue.body));
   assert.ok(prompt.includes(approval.approvedPlan) && prompt.includes(receipt.url));
