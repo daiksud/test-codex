@@ -687,22 +687,36 @@ export async function postApprovedIssuePlan(session, approval, {
   }
 }
 
+async function runIssueSessionStage(session, operation) {
+  const { client, deadline } = session;
+  if (deadline.expired) throw deadline.error;
+  const result = await Promise.race([deadline.expiration, client.failure, operation()]);
+  if (deadline.expired) throw deadline.error;
+  return result;
+}
+
 export async function startApprovedIssueDelivery(session, {
   waitForApproval = waitForIssuePlanApproval,
   postPlan = postApprovedIssuePlan,
   startImplementation = startApprovedIssueImplementation,
 } = {}) {
-  const { client, deadline } = session;
-  async function bounded(operation) {
-    if (deadline.expired) throw deadline.error;
-    const result = await Promise.race([deadline.expiration, client.failure, operation()]);
-    if (deadline.expired) throw deadline.error;
-    return result;
-  }
-  const approval = await bounded(() => waitForApproval(session));
-  const receipt = await bounded(() => postPlan(session, approval));
-  const turnId = await bounded(() => startImplementation(session, approval, receipt));
+  const approval = await runIssueSessionStage(session, () => waitForApproval(session));
+  const receipt = await runIssueSessionStage(session, () => postPlan(session, approval));
+  const turnId = await runIssueSessionStage(session, () => startImplementation(session, approval, receipt));
   return { session, approval, receipt, turnId };
+}
+
+export async function observeIssueDelivery(handoff, {
+  readTurn = readIssueImplementationTurn,
+  auditDelivery = verifyIssueDelivery,
+} = {}) {
+  const { session, approval, receipt, turnId } = handoff;
+  const turn = await runIssueSessionStage(session, () => readTurn(session, turnId));
+  if (turn.status !== "completed") return { turn, report: null, remoteEvidence: null };
+  const report = parseIssueDeliveryReport(turn);
+  const remoteEvidence = report.status === "complete" ?
+    await runIssueSessionStage(session, () => auditDelivery(session, approval, receipt, report)) : null;
+  return { turn, report, remoteEvidence };
 }
 
 function requireApprovedIssueReceipt(session, approval, receipt) {
