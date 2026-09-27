@@ -73,7 +73,11 @@ status の作成者が `github-actions[bot]`、`target_url` が session に保�
 
 この repository で確認した Codex review integration の `chatgpt-codex-connector` の証拠を controller の完了条件にする。
 現在の head の review が未完了なら `@codex review` と head SHA の marker を PR コメントに書き、同じ marker の既存 request は再利用する。
-submitted かつ現在の head の `COMMENTED` / `APPROVED` formal review、またはその request に付いた connector の新しい 👍 を完了の証拠にする。[^github-review]
+submitted かつ現在の head の `COMMENTED` / `APPROVED` formal review、
+または `github-actions[bot]` によるその request に付いた connector の新しい 👍 を完了の証拠にする。[^github-review]
+実際に観測した connector の「Codex Review: Didn't find any major issues. Nice work!」PR コメントも、
+現在の head の Reviewed commit marker と、先行する同じ Actions request・正しい URL・時刻を確認して完了の証拠にする。
+レビューの完了、request の投稿・編集、reaction または指摘なしコメントの時刻が merge より後なら完了にしない。
 `COMMENTED` は、実際の Codex Review と対象 commit の marker を持つ review body を確認する。一般の task reply や環境作成案内の `COMMENTED` record はコードレビューの証拠にしない。
 現在の head の `CHANGES_REQUESTED` / `PENDING` / `DISMISSED` review は未完了として扱う。
 空の bot 集合や古い head の反応では完了にしない。未解決 thread は残せず、Actions writer 自身を external reviewer には数えない。
@@ -101,7 +105,8 @@ actionlint 1.7.12 は `queue: max` を知らないため、そのキーの診断
 20秒で `connecting` → `errored`、HTTP 409 の retry が7回あり、`connected` は観測できなかった。
 原因は未確定。所有 process は終了済み。Remote の接続、ChatGPT の Plan 表示・承認、
 UI が開始する turn の read-only 継承は実機での確認が必要。
-`github-actions[bot]` が投稿した review trigger を connector が処理するか、指摘なしの 👍 がその request に付くかも未検証。
+手動の review request では、現在の commit を示す「指摘なし」の PR コメントを実際に観測した。
+`github-actions[bot]` が投稿した review trigger を connector が処理するか、その request に対する完了の証拠を得られるかは未検証。
 
 API の模擬承認・loopback session 継続・ローカル Git fixture は、ChatGPT アプリの承認の証拠ではない。
 Mac mini の job、author guard、実際の write token、直接 main push の拒否、CI・bot 修正と merge、
