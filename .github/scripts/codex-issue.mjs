@@ -767,6 +767,57 @@ export function parseIssueDeliveryReport(result) {
   return report;
 }
 
+export async function reconcileIssueDelivery(session, report, options = {}) {
+  const qualified = parseIssueDeliveryReport({ status: "completed", text: JSON.stringify(report) });
+  if (qualified.status !== "complete") throw new Error("A qualified complete delivery report is required");
+  const { client, deadline, issue } = session;
+  const { repository, number: issueNumber } = issue;
+  const { request, bounded, lifetime } = createIssueGitHubRequests(session, options);
+  const waitBeforeRetry = options.waitBeforeRetry ?? waitForIssueRetry;
+  const root = `https://api.github.com/repos/${repository}`;
+  async function get(url) {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        return await request(url, "GET");
+      } catch (error) {
+        if (deadline.expired) throw deadline.error;
+        lifetime.throwIfAborted();
+        if (!error.retryable || attempt === 3) throw error;
+        await bounded(() => waitBeforeRetry(error.delayMs ?? 1000 * 2 ** (attempt - 1), { client, deadline }));
+      }
+    }
+  }
+  const remoteIssue = await get(`${root}/issues/${issueNumber}`);
+  if (remoteIssue?.number !== issueNumber || remoteIssue.state !== "closed") {
+    throw new Error("Target Issue is not closed");
+  }
+  const pullRequestNumber = qualified.pullRequestNumber;
+  const prUrl = `${root}/pulls/${pullRequestNumber}`;
+  const pr = await get(prUrl);
+  if (pr?.number !== pullRequestNumber || pr.merged !== true ||
+      pr.base?.ref !== "main" || pr.base?.repo?.full_name !== repository ||
+      pr.head?.repo?.full_name !== repository || pr.head?.ref !== `codex/issue-${issueNumber}` ||
+      !/^[a-f0-9]{40}$/i.test(pr.head?.sha ?? "")) {
+    throw new Error("PR repository, merge, base branch or head evidence does not match this Issue");
+  }
+  let linked = false;
+  for (let page = 1; ; page += 1) {
+    const events = await get(`${root}/issues/${issueNumber}/timeline?per_page=100&page=${page}`);
+    if (!Array.isArray(events)) throw new Error("Invalid Issue timeline response");
+    linked = events.some(event => event?.event === "cross-referenced" &&
+      event.source?.issue?.number === pullRequestNumber &&
+      event.source.issue.repository?.full_name === repository &&
+      event.source.issue.pull_request?.url === prUrl);
+    if (linked || events.length < 100) break;
+  }
+  if (!linked) throw new Error("Merged PR has no matching Issue cross-reference link");
+  const main = await get(`${root}/git/ref/heads/main`);
+  if (main?.ref !== "refs/heads/main" || main.object?.sha !== qualified.localMainSha) {
+    throw new Error("Reported local main does not match remote main");
+  }
+  return { repository, issueNumber, pullRequestNumber, headSha: pr.head.sha, mainSha: main.object.sha };
+}
+
 function issuePlanPrompt(issue) {
   return [
     `Plan the work described in GitHub Issue #${issue.number}: ${issue.title}`,
