@@ -87,13 +87,14 @@ class FakeAppServer {
 
   async nextEvent() {
     const event = this.events.shift();
-    if (!event) throw new Error("unexpected end of fake event stream");
-    return event;
+    if (event) return event;
+    return new Promise((resolve, reject) => { this.rejectPendingEvent = reject; });
   }
 
   close() {
     if (this.closeCount > 0) return;
     this.closeCount += 1;
+    this.rejectPendingEvent?.(new Error("Codex app-server client is closed"));
   }
 }
 

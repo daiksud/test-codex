@@ -470,6 +470,7 @@ export async function postIssueFailureComment(
 
 export async function runIssuePlanCli({
   startJob = runIssuePlanJob,
+  executeDelivery = runApprovedIssueSession,
   commentIssue = postIssueFailureComment,
   writeStdout = (text) => process.stdout.write(text),
   writeStderr = (text) => process.stderr.write(text),
@@ -478,20 +479,29 @@ export async function runIssuePlanCli({
   },
 } = {}) {
   let session;
+  let sessionClosed = false;
+  function closeOwnedSession() {
+    if (!session || sessionClosed) return;
+    sessionClosed = true;
+    session.deadline.cancel();
+    if (!session.deadline.expired) session.client.close();
+  }
   try {
     session = await startJob();
     writeStdout(
       `Codex Plan generated for Issue #${session.issue.number} ` +
         `(thread ${session.threadId}).\n`,
     );
-    await Promise.race([session.deadline.expiration, session.client.failure]);
+    const delivery = await runIssueSessionStage(session, () => executeDelivery(session));
+    if (delivery?.report?.status !== "complete" || !delivery.remoteEvidence) {
+      throw new Error("Approved delivery returned no checked remote evidence");
+    }
+    writeStdout(`Remote delivery conditions checked for Issue #${session.issue.number} (PR #${delivery.remoteEvidence.pullRequestNumber}). Codex reports cleanup on synchronized, clean main.\n`);
+    setExitCode(0);
   } catch (error) {
     setExitCode(1);
     writeStderr(`Codex Issue session failed: ${error.message}\n`);
-    if (session && !session.deadline.expired) {
-      session.deadline.cancel();
-      session.client.close();
-    }
+    closeOwnedSession();
     const issue = error.issue ?? session?.issue;
     if (error.code === "ISSUE_DEADLINE_EXCEEDED" && issue) {
       try {
@@ -502,6 +512,8 @@ export async function runIssuePlanCli({
         );
       }
     }
+  } finally {
+    closeOwnedSession();
   }
 }
 
