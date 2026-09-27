@@ -926,6 +926,29 @@ export async function continueIssueAfterFinding(handoff, outcome) {
   return startAuthorizedIssueTurn(session, profile, prompt);
 }
 
+export async function runIssueFailureCleanup(session, reason, {
+  quiesce = quiesceIssueForCleanup,
+  startCleanup = startIssueCleanup,
+  readTurn = readIssueImplementationTurn,
+} = {}) {
+  if (typeof reason !== "string" || !reason.trim()) throw new Error("A nonempty failure reason is required for cleanup");
+  if (session.deadline.expired) throw session.deadline.error;
+  const context = session.deliveryContext;
+  if (!context) throw new Error("Retained approved delivery context is required");
+  requireApprovedIssueReceipt(session, context.approval, context.receipt);
+  await runIssueSessionStage(session, () => quiesce(session));
+  const handoff = { session, ...context };
+  const turnId = await runIssueSessionStage(session, () => startCleanup(handoff, reason));
+  const turn = await runIssueSessionStage(session, () => readTurn(session, turnId));
+  const cleanupReport = parseIssueDeliveryReport(turn);
+  if (cleanupReport.status !== "failed" || cleanupReport.localBranch !== "main" ||
+      !/^[a-f0-9]{40}$/i.test(cleanupReport.localMainSha ?? "") ||
+      !cleanupReport.clean || cleanupReport.todo.length !== 0) {
+    throw new Error("Cleanup report does not establish clean local main while retaining failed delivery status");
+  }
+  return { status: "failed", cleanupReport };
+}
+
 export async function quiesceIssueForCleanup(session, {
   waitBeforePoll = waitForIssueRetry,
 } = {}) {
