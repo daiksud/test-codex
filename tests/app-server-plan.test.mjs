@@ -19,9 +19,14 @@ class FakeAppServer {
     modes = null,
     modelPages = null,
     events = null,
+    turnIds = ["turn-plan"],
+    turnStartError = null,
   } = {}) {
     this.requests = [];
     this.notifications = [];
+    this.turnIds = [...turnIds];
+    this.turnStartError = turnStartError;
+    this.failure = new Promise(() => {});
     this.events =
       events ?? [
         {
@@ -73,7 +78,8 @@ class FakeAppServer {
       case "thread/start":
         return { thread: { id: "thread-issue-6" } };
       case "turn/start":
-        return { turn: { id: "turn-plan", status: "inProgress" } };
+        if (this.turnStartError) throw this.turnStartError;
+        return { turn: { id: this.turnIds.shift(), status: "inProgress" } };
       default:
         throw new Error(`unexpected app-server request: ${method}`);
     }
@@ -160,6 +166,146 @@ test("starts one persistent Plan turn with read-only, no-network policy", async 
     appServer.requests.filter(({ method }) => method === "turn/start").length,
     1,
   );
+});
+
+function terminalTurn(id, status, codexErrorInfo) {
+  return {
+    method: "turn/completed",
+    params: {
+      threadId: "thread-issue-6",
+      turn: {
+        id, status,
+        ...(status === "failed" ? { error: {
+          message: "upstream failed",
+          ...(codexErrorInfo === undefined ? {} : { codexErrorInfo }),
+        } } : {}),
+      },
+    },
+  };
+}
+
+function planItem(turnId, text) {
+  return {
+    method: "item/completed",
+    params: { threadId: "thread-issue-6", turnId, item: { type: "plan", text } },
+  };
+}
+
+test("retries confirmed transient Plan failures in the same read-only thread", async () => {
+  for (const info of [
+    { httpConnectionFailed: { httpStatusCode: 503 } },
+    { httpConnectionFailed: { httpStatusCode: null } },
+    { responseStreamDisconnected: { httpStatusCode: null } },
+    { responseTooManyFailedAttempts: { httpStatusCode: 429 } },
+    "serverOverloaded",
+    "rateLimitExceeded",
+    "internalServerError",
+    { responseStreamConnectionFailed: { httpStatusCode: 408 } },
+    { responseStreamConnectionFailed: { httpStatusCode: null } },
+  ]) {
+    const client = new FakeAppServer({
+      turnIds: ["attempt-1", "attempt-2"],
+      events: [
+        planItem("attempt-1", "incomplete first plan"),
+        terminalTurn("attempt-1", "failed", info),
+        planItem("attempt-2", "verified second plan"),
+        terminalTurn("attempt-2", "completed"),
+      ],
+    });
+    const delays = [];
+    const result = await startIssuePlanTurn(client, {
+      workspace, issue, waitBeforeRetry: async (ms) => { delays.push(ms); },
+    });
+    assert.equal(result.plan, "verified second plan");
+    assert.equal(result.turnId, "attempt-2");
+    assert.equal(result.threadId, "thread-issue-6");
+    assert.deepEqual(delays, [1000]);
+    assert.equal(client.requests.filter((r) => r.method === "thread/start").length, 1);
+    const turns = client.requests.filter((r) => r.method === "turn/start");
+    assert.equal(turns.length, 2);
+    for (const turn of turns) {
+      assert.equal(turn.params.threadId, "thread-issue-6");
+      assert.equal(turn.params.collaborationMode.mode, "plan");
+      assert.deepEqual(turn.params.sandboxPolicy, { type: "readOnly", networkAccess: false });
+    }
+  }
+});
+
+test("does not start another turn while app-server internally retries", async () => {
+  const client = new FakeAppServer({ events: [
+    { method: "error", params: {
+      threadId: "thread-issue-6", turnId: "turn-plan", willRetry: true,
+      error: { message: "retrying upstream", codexErrorInfo: "serverOverloaded" },
+    } },
+    planItem("turn-plan", planText),
+    terminalTurn("turn-plan", "completed"),
+  ] });
+  let delays = 0;
+  const result = await startIssuePlanTurn(client, {
+    workspace, issue, waitBeforeRetry: async () => { delays += 1; },
+  });
+  assert.equal(result.plan, planText);
+  assert.equal(delays, 0);
+  assert.equal(client.requests.filter((r) => r.method === "turn/start").length, 1);
+});
+
+test("does not retry permanent, unclassified, or interrupted Plan failures", async () => {
+  for (const [status, info] of [
+    ["failed", "unauthorized"],
+    ["failed", { httpConnectionFailed: { httpStatusCode: 401 } }],
+    ["failed", { responseTooManyFailedAttempts: { httpStatusCode: null } }],
+    ["failed", undefined],
+    ["interrupted", "serverOverloaded"],
+  ]) {
+    const client = new FakeAppServer({ events: [terminalTurn("turn-plan", status, info)] });
+    let delays = 0;
+    await assert.rejects(startIssuePlanTurn(client, {
+      workspace, issue, waitBeforeRetry: async () => { delays += 1; },
+    }), new RegExp(`status ${status}`));
+    assert.equal(delays, 0);
+    assert.equal(client.requests.filter((r) => r.method === "turn/start").length, 1);
+  }
+});
+
+test("stops after three failed Plan attempts with bounded backoff", async () => {
+  const client = new FakeAppServer({
+    turnIds: ["attempt-1", "attempt-2", "attempt-3"],
+    events: [1, 2, 3].map((n) => terminalTurn(`attempt-${n}`, "failed", "serverOverloaded")),
+  });
+  const delays = [];
+  await assert.rejects(startIssuePlanTurn(client, {
+    workspace, issue, waitBeforeRetry: async (ms) => { delays.push(ms); },
+  }), /status failed/);
+  assert.equal(client.requests.filter((r) => r.method === "thread/start").length, 1);
+  assert.equal(client.requests.filter((r) => r.method === "turn/start").length, 3);
+  assert.deepEqual(delays, [1000, 2000]);
+});
+
+test("does not replay an ambiguously failed turn-start RPC", async () => {
+  const rpcError = new Error("upstream HTTP 503 while starting turn");
+  rpcError.code = -32000;
+  const client = new FakeAppServer({ turnStartError: rpcError });
+  let waits = 0;
+  await assert.rejects(startIssuePlanTurn(client, {
+    workspace, issue, waitBeforeRetry: async () => { waits += 1; },
+  }), (error) => error === rpcError);
+  assert.equal(waits, 0);
+  assert.equal(client.requests.filter((r) => r.method === "turn/start").length, 1);
+});
+
+test("does not reuse a failed attempt's Plan when a retry has no final Plan", async () => {
+  const client = new FakeAppServer({
+    turnIds: ["attempt-1", "attempt-2"],
+    events: [
+      planItem("attempt-1", "stale plan"),
+      terminalTurn("attempt-1", "failed", "serverOverloaded"),
+      terminalTurn("attempt-2", "completed"),
+    ],
+  });
+  await assert.rejects(startIssuePlanTurn(client, {
+    workspace, issue, waitBeforeRetry: async () => {},
+  }), /without a concrete plan/);
+  assert.equal(client.requests.filter((r) => r.method === "turn/start").length, 2);
 });
 
 test("accepts valid final pages when the app-server omits nextCursor", async () => {

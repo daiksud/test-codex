@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const MAX_ISSUE_RUNTIME_MS = 24 * 60 * 60 * 1000;
+const MAX_PLAN_ATTEMPTS = 3;
 
 export function spawnCodexAppServer({ workspace, spawnProcess = spawnChild }) {
   const child = spawnProcess(
@@ -333,7 +334,7 @@ export async function startIssuePlanSession({
 
   try {
     const plan = await Promise.race([
-      startIssuePlanTurn(client, { workspace, issue }),
+      startIssuePlanTurn(client, { workspace, issue, deadline }),
       deadline.expiration,
     ]);
     return {
@@ -497,7 +498,63 @@ function requireNoMcpTools(servers) {
   }
 }
 
-export async function startIssuePlanTurn(client, { workspace, issue }) {
+function isTransientPlanError(info) {
+  if (["rateLimitExceeded", "serverOverloaded", "internalServerError"].includes(info)) {
+    return true;
+  }
+  if (!info || typeof info !== "object") return false;
+  for (const kind of [
+    "httpConnectionFailed", "responseStreamConnectionFailed",
+    "responseStreamDisconnected", "responseTooManyFailedAttempts",
+  ]) {
+    if (!Object.hasOwn(info, kind)) continue;
+    const details = info[kind];
+    if (!details || typeof details !== "object") return false;
+    const status = details.httpStatusCode;
+    if (status == null) return kind !== "responseTooManyFailedAttempts";
+    return Number.isInteger(status) &&
+      (status === 408 || status === 429 || (status >= 500 && status < 600));
+  }
+  return false;
+}
+
+async function waitForPlanRetry(delayMs, { client, deadline }) {
+  let timer;
+  try {
+    await Promise.race([
+      new Promise((resolve) => { timer = setTimeout(resolve, delayMs); }),
+      client.failure,
+      ...(deadline ? [deadline.expiration] : []),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readPlanTurnResult(client, threadId, turnId) {
+  let plan = null;
+  let error = null;
+  while (true) {
+    const event = await client.nextEvent();
+    const params = event?.params ?? {};
+    if (params.threadId !== threadId) continue;
+    if (event.method === "error" && params.turnId === turnId) error = params.error;
+    if (
+      (event.method === "item/started" || event.method === "item/completed") &&
+      params.turnId === turnId
+    ) {
+      if (params.item?.type === "fileChange") throw new Error("Plan turn must not modify files");
+      if (event.method === "item/completed" && params.item?.type === "plan") plan = params.item.text;
+    }
+    if (event.method === "turn/completed" && params.turn?.id === turnId) {
+      return { status: params.turn.status, plan, error: params.turn.error ?? error };
+    }
+  }
+}
+
+export async function startIssuePlanTurn(client, {
+  workspace, issue, deadline, waitBeforeRetry = waitForPlanRetry,
+}) {
   await client.request("initialize", {
     clientInfo: {
       name: "codex_issue_workflow",
@@ -539,7 +596,7 @@ export async function startIssuePlanTurn(client, { workspace, issue }) {
     throw new Error("Codex app-server did not return a persistent thread ID");
   }
 
-  const turnResponse = await client.request("turn/start", {
+  const turnParams = {
     threadId,
     input: [{ type: "text", text: issuePlanPrompt(issue) }],
     cwd: workspace,
@@ -554,38 +611,26 @@ export async function startIssuePlanTurn(client, { workspace, issue }) {
         developer_instructions: null,
       },
     },
-  });
-  const turnId = turnResponse?.turn?.id;
-  if (typeof turnId !== "string" || turnId.length === 0) {
-    throw new Error("Codex app-server did not return a Plan turn ID");
-  }
-
-  let plan = null;
-  while (true) {
-    const event = await client.nextEvent();
-    const params = event?.params ?? {};
-    if (params.threadId !== threadId) continue;
-
-    if (
-      (event.method === "item/started" || event.method === "item/completed") &&
-      params.turnId === turnId
-    ) {
-      if (params.item?.type === "fileChange") {
-        throw new Error("Plan turn must not modify files");
-      }
-      if (event.method === "item/completed" && params.item?.type === "plan") {
-        plan = params.item.text;
-      }
+  };
+  for (let attempt = 1; ; attempt += 1) {
+    if (deadline?.expired) throw deadline.error;
+    const turnResponse = await client.request("turn/start", turnParams);
+    const turnId = turnResponse?.turn?.id;
+    if (typeof turnId !== "string" || turnId.length === 0) {
+      throw new Error("Codex app-server did not return a Plan turn ID");
     }
-
-    if (event.method !== "turn/completed" || params.turn?.id !== turnId) {
+    const result = await readPlanTurnResult(client, threadId, turnId);
+    if (result.status === "failed" && attempt < MAX_PLAN_ATTEMPTS &&
+        isTransientPlanError(result.error?.codexErrorInfo)) {
+      await waitBeforeRetry(1000 * 2 ** (attempt - 1), { client, deadline });
       continue;
     }
-    if (params.turn.status !== "completed") {
+    if (result.status !== "completed") {
       throw new Error(
-        `Codex Plan turn ended with status ${params.turn.status ?? "unknown"}`,
+        `Codex Plan turn ended with status ${result.status ?? "unknown"}`,
       );
     }
+    const { plan } = result;
     if (typeof plan !== "string" || plan.trim().length === 0) {
       throw new Error("Plan turn completed without a concrete plan");
     }

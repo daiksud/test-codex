@@ -830,3 +830,60 @@ test("direct CLI execution exits nonzero for an expired event without Codex", ()
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+for (const stop of ["deadline", "transport"]) {
+  test(`${stop} cancels Plan retry backoff without starting another turn`, async () => {
+    const scheduler = createFakeDeadlineScheduler();
+    const client = new FakeAppServer();
+    client.events = [{ method: "turn/completed", params: {
+      threadId: "thread-19",
+      turn: { id: "turn-plan", status: "failed", error: {
+        message: "temporarily overloaded", codexErrorInfo: "serverOverloaded",
+      } },
+    } }];
+    const stopError = new Error("app-server connection lost during retry");
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    let backoff;
+    let backoffCleared = false;
+    let deadlineFired = false;
+    globalThis.setTimeout = (callback, delayMs) => {
+      backoff = { callback, delayMs };
+      return backoff;
+    };
+    globalThis.clearTimeout = (timer) => {
+      if (timer === backoff) backoffCleared = true;
+    };
+    const startup = issueFlow.startIssuePlanSession({
+      eventPath, workspace, nowMs: Date.parse(issueCreatedAt), deadlineScheduler: scheduler,
+      readEvent: () => issueEvent, createClient: () => client,
+    });
+    let settled = false;
+    startup.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await setImmediate();
+      assert.ok(backoff, "a transient failure must enter backoff before another Plan turn");
+      assert.equal(backoff.delayMs, 1000);
+      if (stop === "deadline") {
+        deadlineFired = true;
+        scheduler.fire();
+      } else {
+        client.failTransport(stopError);
+      }
+      await setImmediate();
+      assert.equal(settled, true, "terminal loss must interrupt retry waiting promptly");
+      await assert.rejects(startup, (error) => stop === "deadline"
+        ? /Issue deadline expired/.test(error.message) : error === stopError);
+      assert.equal(backoffCleared, true);
+      assert.equal(client.requests.filter((r) => r.method === "turn/start").length, 1);
+      assert.equal(client.closeCount, 1);
+    } finally {
+      if (!deadlineFired && !scheduler.tasks[0].cleared) scheduler.fire();
+      client.failTransport(stopError);
+      if (backoff && !backoffCleared) backoff.callback();
+      await startup.catch(() => {});
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+    }
+  });
+}
