@@ -620,6 +620,14 @@ function createIssueGitHubRequests(session, {
         delayMs: retryDelay(response, rateLimited),
       });
     }
+    if (url === "https://api.github.com/graphql" && data?.errors != null &&
+        (!Array.isArray(data.errors) || data.errors.length > 0)) {
+      const rateLimited = response.headers.get("x-ratelimit-remaining") === "0" ||
+        (Array.isArray(data.errors) && data.errors.some(error => error?.type === "RATE_LIMITED"));
+      throw Object.assign(new Error("GitHub GraphQL query failed"), {
+        retryable: rateLimited, delayMs: retryDelay(response, rateLimited),
+      });
+    }
     return data;
   }
   return { request, bounded, lifetime };
@@ -771,10 +779,10 @@ function createIssueGitHubReader(session, options) {
   const { client, deadline } = session;
   const { request, bounded, lifetime } = createIssueGitHubRequests(session, options);
   const waitBeforeRetry = options.waitBeforeRetry ?? waitForIssueRetry;
-  async function get(url) {
+  async function get(url, query) {
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
-        return await request(url, "GET");
+        return await request(url, query ? "POST" : "GET", query);
       } catch (error) {
         if (deadline.expired) throw deadline.error;
         lifetime.throwIfAborted();
@@ -872,6 +880,106 @@ export async function verifyIssueRequiredCi(session, facts, options = {}) {
   }
   if (!latestStatus && !hasCheck) throw new Error("Missing required CI evidence");
   return { headSha, requiredContext: context };
+}
+
+export async function verifyIssueBotReviews(session, facts, options = {}) {
+  const { issue } = session;
+  if (facts?.repository !== issue.repository || facts.issueNumber !== issue.number ||
+      !Number.isSafeInteger(facts.pullRequestNumber) || facts.pullRequestNumber <= 0 ||
+      !/^[a-f0-9]{40}$/i.test(facts.headSha ?? "")) {
+    throw new Error("Bot review facts must match this Issue and a valid PR head");
+  }
+  const read = createIssueGitHubReader(session, options);
+  const [owner, name] = issue.repository.split("/");
+  const number = facts.pullRequestNumber;
+  const variables = { owner, name, number };
+  const participants = new Set();
+  function botLogin(login) {
+    if (typeof login !== "string" || !login.replace(/\[bot\]$/, "")) throw new Error("Invalid Bot identity");
+    return login.replace(/\[bot\]$/, "");
+  }
+  function page(value, seen) {
+    if (!Array.isArray(value?.nodes) || typeof value.pageInfo?.hasNextPage !== "boolean") {
+      throw new Error("Invalid review pagination response");
+    }
+    if (!value.pageInfo.hasNextPage) return null;
+    const cursor = value.pageInfo.endCursor;
+    if (typeof cursor !== "string" || !cursor || seen.has(cursor)) throw new Error("Invalid review pagination cursor");
+    seen.add(cursor);
+    return cursor;
+  }
+  async function queryPr(operationName, field, selection, cursor) {
+    const response = await read("https://api.github.com/graphql", {
+      operationName, variables: { ...variables, cursor },
+      query: `query ${operationName}($owner:String!,$name:String!,$number:Int!,$cursor:String) { repository(owner:$owner,name:$name) { pullRequest(number:$number) { number headRefOid ${field}(first:100,after:$cursor) { nodes { ${selection} } pageInfo { hasNextPage endCursor } } } } }`,
+    });
+    const pr = response?.data?.repository?.pullRequest;
+    if (pr?.number !== number || pr.headRefOid !== facts.headSha) throw new Error("Invalid Bot query PR/head evidence");
+    return pr[field];
+  }
+  let cursor = null;
+  const requestCursors = new Set();
+  do {
+    const requests = await queryPr("IssueReviewRequests", "reviewRequests", "requestedReviewer { __typename ... on Bot { login } ... on User { login } }", cursor);
+    cursor = page(requests, requestCursors);
+    for (const request of requests.nodes) {
+      if (typeof request?.requestedReviewer?.__typename !== "string") throw new Error("Invalid requested reviewer");
+      if (request.requestedReviewer.__typename === "Bot") throw new Error("Bot review request is still pending");
+    }
+  } while (cursor !== null);
+  const latestReviews = new Map();
+  for (let index = 1; ; index += 1) {
+    const reviews = await read(`https://api.github.com/repos/${issue.repository}/pulls/${number}/reviews?per_page=100&page=${index}`);
+    if (!Array.isArray(reviews)) throw new Error("Invalid submitted reviews response");
+    for (const review of reviews) {
+      if (typeof review?.user?.type !== "string") throw new Error("Invalid review author");
+      if (review.user.type === "Bot") {
+        const login = botLogin(review.user.login);
+        participants.add(login);
+        latestReviews.set(login, review);
+      }
+    }
+    if (reviews.length < 100) break;
+  }
+  async function inspectComments(thread) {
+    let comments = thread.comments;
+    const cursors = new Set();
+    while (true) {
+      const nextCursor = page(comments, cursors);
+      for (const comment of comments.nodes) {
+        if (typeof comment?.author?.__typename !== "string") throw new Error("Invalid review comment author");
+        if (comment.author.__typename === "Bot") {
+          participants.add(botLogin(comment.author.login));
+          if (!thread.isResolved) throw new Error("Unresolved Bot review thread remains");
+        }
+      }
+      if (nextCursor === null) break;
+      const response = await read("https://api.github.com/graphql", {
+        operationName: "IssueReviewComments", variables: { id: thread.id, cursor: nextCursor },
+        query: "query IssueReviewComments($id:ID!,$cursor:String) { node(id:$id) { ... on PullRequestReviewThread { id comments(first:100,after:$cursor) { nodes { author { __typename login } } pageInfo { hasNextPage endCursor } } } } }",
+      });
+      if (response?.data?.node?.id !== thread.id) throw new Error("Invalid review thread query response");
+      comments = response.data.node.comments;
+    }
+  }
+  cursor = null;
+  const threadCursors = new Set();
+  do {
+    const threads = await queryPr("IssueReviewThreads", "reviewThreads", "id isResolved comments(first:100) { nodes { author { __typename login } } pageInfo { hasNextPage endCursor } }", cursor);
+    cursor = page(threads, threadCursors);
+    for (const thread of threads.nodes) {
+      if (typeof thread?.id !== "string" || !thread.id || typeof thread.isResolved !== "boolean") throw new Error("Invalid review thread");
+      await inspectComments(thread);
+    }
+  } while (cursor !== null);
+  for (const login of participants) {
+    const review = latestReviews.get(login);
+    if (!review || review.commit_id !== facts.headSha || !["COMMENTED", "APPROVED"].includes(review.state) ||
+        typeof review.submitted_at !== "string" || !review.submitted_at) {
+      throw new Error("Bot has no completed review on the latest PR head");
+    }
+  }
+  return { headSha: facts.headSha, bots: [...participants].sort() };
 }
 
 function issuePlanPrompt(issue) {
