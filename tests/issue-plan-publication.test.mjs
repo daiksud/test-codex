@@ -36,6 +36,14 @@ function comment(text = body, id = 987) {
   return { id, body: text, html_url: `https://github.com/daiksud/test-codex/issues/19#issuecomment-${id}`, user: { login: "github-actions[bot]" } };
 }
 
+function expectedReceipt() {
+  return {
+    id: 987, url: comment().html_url, threadId: "issue-thread",
+    approvalTurnId: approval.approvalTurnId, approvedPlan: approval.approvedPlan,
+    repository: "daiksud/test-codex", issueNumber: 19,
+  };
+}
+
 function response(status, data, headers = {}) {
   return { ok: status >= 200 && status < 300, status, headers: new Headers(headers), json: async () => data };
 }
@@ -54,7 +62,7 @@ test("publishes exact approved text with its session identity and scoped token",
       return options.method === "POST" ? response(201, comment()) : response(200, []);
     },
   });
-  assert.deepEqual(result, { id: 987, url: comment().html_url });
+  assert.deepEqual(result, expectedReceipt());
   assert.deepEqual(calls.map(call => [call.url, call.options.method]), [[endpoint + "?per_page=100&page=1", "GET"], [endpoint, "POST"]]);
   assert.deepEqual(JSON.parse(calls[1].options.body), { body });
   assert.equal(calls[1].options.headers.Authorization, "Bearer test-only-token");
@@ -93,8 +101,26 @@ test("checks later pages and reuses only the exact bot-authored Plan", async () 
       return response(200, calls.length === 1 ? firstPage : [comment()]);
     },
   });
-  assert.deepEqual(result, { id: 987, url: comment().html_url });
+  assert.deepEqual(result, expectedReceipt());
   assert.deepEqual(calls, [endpoint + "?per_page=100&page=1", endpoint + "?per_page=100&page=2"]);
+});
+
+test("binds the receipt to the approved text captured before API awaits", async () => {
+  const fake = fixture();
+  const mutableApproval = { ...approval };
+  const result = await issueFlow.postApprovedIssuePlan(fake.session, mutableApproval, {
+    env,
+    fetchImpl: async (url, options) => {
+      if (options.method === "GET") {
+        mutableApproval.approvedPlan = "A different unrecorded plan";
+        mutableApproval.approvalTurnId = "a-later-turn";
+        return response(200, []);
+      }
+      assert.deepEqual(JSON.parse(options.body), { body });
+      return response(201, comment());
+    },
+  });
+  assert.deepEqual(result, expectedReceipt());
 });
 
 test("inspects remote state after an uncertain POST instead of posting twice", async () => {

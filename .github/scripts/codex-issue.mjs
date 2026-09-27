@@ -1,4 +1,5 @@
 import { execFile, spawn as spawnChild } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,6 +35,8 @@ export async function createCodexAppServer({
 export function spawnCodexAppServer({
   workspace, spawnProcess = spawnChild, mcpServerNames = [],
 }) {
+  const implementationProfile = `codex_issue_workspace_${randomUUID()}`;
+  const root = resolve(workspace);
   const child = spawnProcess(
     "codex",
     [
@@ -47,6 +50,10 @@ export function spawnCodexAppServer({
         "-c",
         `mcp_servers={${mcpServerNames.map(name => `${JSON.stringify(name)}={enabled=false}`).join(",")}}`,
       ] : []),
+      "-c",
+      `permissions.${implementationProfile}.filesystem={":root"="read",${JSON.stringify(root)}="write",${JSON.stringify(resolve(root, ".git"))}="write"}`,
+      "-c",
+      `permissions.${implementationProfile}.network.enabled=true`,
     ],
     { cwd: workspace, stdio: ["pipe", "pipe", "inherit"] },
   );
@@ -175,6 +182,7 @@ export function spawnCodexAppServer({
   }
 
   return {
+    implementationProfile,
     failure,
     request(method, params = {}) {
       if (terminalError) return Promise.reject(terminalError);
@@ -541,12 +549,14 @@ export async function postApprovedIssuePlan(session, approval, {
       typeof approval.approvedPlan !== "string" || !approval.approvedPlan.trim()) {
     throw new Error("A captured nonempty approved Plan is required");
   }
+  const { approvalTurnId, approvedPlan } = approval;
+  const { repository, number: issueNumber } = issue;
   const stopApi = new AbortController();
   client.failure.catch(error => stopApi.abort(error));
   const lifetime = AbortSignal.any([session.signal, stopApi.signal]);
-  const body = `<!-- codex-approved-plan:${threadId}:${approval.approvalTurnId} -->\n` +
-    `## Approved Codex Plan\n\n${approval.approvedPlan}`;
-  const endpoint = `https://api.github.com/repos/${issue.repository}/issues/${issue.number}/comments`;
+  const body = `<!-- codex-approved-plan:${threadId}:${approvalTurnId} -->\n` +
+    `## Approved Codex Plan\n\n${approvedPlan}`;
+  const endpoint = `https://api.github.com/repos/${repository}/issues/${issueNumber}/comments`;
   const headers = {
     Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`,
     "Content-Type": "application/json", "X-GitHub-Api-Version": "2026-03-10",
@@ -614,10 +624,13 @@ export async function postApprovedIssuePlan(session, approval, {
   function result(comment) {
     if (!Number.isSafeInteger(comment?.id) || comment.id <= 0 || comment.body !== body ||
         comment.user?.login !== "github-actions[bot]" ||
-        comment.html_url !== `https://github.com/${issue.repository}/issues/${issue.number}#issuecomment-${comment.id}`) {
+        comment.html_url !== `https://github.com/${repository}/issues/${issueNumber}#issuecomment-${comment.id}`) {
       throw new Error("Invalid GitHub approved Plan comment response");
     }
-    return { id: comment.id, url: comment.html_url };
+    return {
+      id: comment.id, url: comment.html_url, threadId, approvalTurnId,
+      repository, issueNumber, approvedPlan,
+    };
   }
   let uncertainPost = false;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -643,6 +656,62 @@ export async function postApprovedIssuePlan(session, approval, {
       await bounded(() => waitBeforeRetry(error.delayMs ?? 1000 * 2 ** (attempt - 1), { client, deadline }));
     }
   }
+}
+
+export async function startApprovedIssueImplementation(session, approval, receipt) {
+  const { client, deadline, threadId, workspace, issue } = session;
+  if (deadline.expired) throw deadline.error;
+  if (!receipt || !Number.isSafeInteger(receipt.id) || receipt.id <= 0 ||
+      receipt.threadId !== threadId || receipt.approvalTurnId !== approval?.approvalTurnId ||
+      receipt.repository !== issue.repository || receipt.issueNumber !== issue.number ||
+      typeof receipt.approvedPlan !== "string" || !receipt.approvedPlan.trim() ||
+      receipt.approvedPlan !== approval?.approvedPlan ||
+      receipt.url !== `https://github.com/${issue.repository}/issues/${issue.number}#issuecomment-${receipt.id}`) {
+    throw new Error("An exact matching approved Plan publication receipt is required");
+  }
+  const profile = client.implementationProfile;
+  if (typeof profile !== "string" || !profile.startsWith("codex_issue_workspace_")) {
+    throw new Error("The owned workspace implementation profile is required");
+  }
+  const prompt = [
+    `Continue Issue ${issue.url} in this same Codex session. The Issue is the sole specification.`,
+    `The user approved the exact Plan below in ChatGPT; it is already recorded at ${receipt.url}.`,
+    `Perform Git operations yourself using Git commands directly. Create codex/issue-${issue.number} before implementation; never push directly to main. Do not use worktree, Docker, Colima, devcontainer, ephemeral sandbox, or GitHub Projects.`,
+    "Use the supplied GITHUB_TOKEN through GH_TOKEN for authorized repository writes. Its GitHub Actions bot identity is intentional; do not change accounts or global configuration. Never print credentials or broad credential-bearing configuration.",
+    "Implement the approved Plan within the Issue scope, run repository test, lint, and build checks, self-review, then commit, push and open a pull request. Use English Conventional Commits.",
+    "GITHUB_TOKEN pushes do not trigger push CI. For every PR head, report a pending Codex verification commit status with the Actions run URL, execute the repository checks on that exact head, and report success only if those checks succeed. Update the status after every fix.",
+    "While CI is pending, perform self-review, add findings to ToDo and fix them. For bot review, wait for configured bots, address valid findings and obtain a completed review for the latest head. Do not request human review.",
+    "Merge only when all required CI is successful, bot review is complete, every actionable finding is resolved, and ToDo is empty. Resolve conflicts without weakening repository protections; squash merge through the PR.",
+    "After merge, return to main, fetch and sync with remote, delete the local working branch, and verify a clean working tree. Verify the Issue is closed and do not carry this Issue's state into the next one.",
+    "Automatically retry transient network/API/CI/review/service failures within the original 24-hour deadline. Inspect remote state before retrying a mutation with an unknown outcome; investigate and fix code/test/review failures instead of blindly retrying them. On failure, record its reason when possible and perform cleanup yourself.",
+    `Title: ${issue.title}\nIssue body:\n${issue.body}`,
+    `Approved Plan (verbatim):\n${receipt.approvedPlan}`,
+  ].join("\n\n");
+  async function bounded(operation) {
+    if (deadline.expired) throw deadline.error;
+    const result = await Promise.race([deadline.expiration, client.failure, operation()]);
+    if (deadline.expired) throw deadline.error;
+    return result;
+  }
+  const metadata = await bounded(() => client.request("thread/read", { threadId, includeTurns: false }));
+  const thread = metadata?.thread;
+  if (thread?.id !== threadId || typeof thread.model !== "string" || !thread.model) {
+    throw new Error("Current thread or model metadata is unavailable");
+  }
+  const started = await bounded(() => client.request("turn/start", {
+    threadId, cwd: workspace, permissions: profile, approvalPolicy: "never",
+    collaborationMode: {
+      mode: "default", settings: {
+        model: thread.model, reasoning_effort: thread.reasoningEffort ?? null,
+        developer_instructions: null,
+      },
+    },
+    input: [{ type: "text", text: prompt }],
+  }));
+  if (typeof started?.turn?.id !== "string" || !started.turn.id) {
+    throw new Error("Codex app-server did not return an implementation turn ID");
+  }
+  return started.turn.id;
 }
 
 function issuePlanPrompt(issue) {

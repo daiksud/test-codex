@@ -58,6 +58,7 @@ test("spawns a job-owned app-server without inventing MCP entries", () => {
   const existingCodexHome = process.env.CODEX_HOME;
 
   const client = spawnCodexAppServer({ workspace, spawnProcess: fake.spawnProcess });
+  assert.match(client.implementationProfile, /^codex_issue_workspace_[0-9a-f-]{36}$/);
 
   assert.deepEqual(fake.calls, [
     {
@@ -69,6 +70,10 @@ test("spawns a job-owned app-server without inventing MCP entries", () => {
         "apps",
         "--disable",
         "plugins",
+        "-c",
+        `permissions.${client.implementationProfile}.filesystem={":root"="read","${workspace}"="write","${workspace}/.git"="write"}`,
+        "-c",
+        `permissions.${client.implementationProfile}.network.enabled=true`,
       ],
       options: { cwd: workspace, stdio: ["pipe", "pipe", "inherit"] },
     },
@@ -84,8 +89,9 @@ test("disables only discovered MCP names with literal inline-table keys", () => 
     workspace, spawnProcess: fake.spawnProcess,
     mcpServerNames: ["computer-use", "name.with.dot", 'quoted"name'],
   });
-  assert.deepEqual(fake.calls[0].args.slice(6), [
-    "-c",
+  const index = fake.calls[0].args.findIndex(value => value.startsWith("mcp_servers="));
+  assert.equal(fake.calls[0].args[index - 1], "-c");
+  assert.deepEqual([fake.calls[0].args[index]], [
     'mcp_servers={"computer-use"={enabled=false},"name.with.dot"={enabled=false},"quoted\\"name"={enabled=false}}',
   ]);
   client.close();
@@ -109,8 +115,8 @@ test("discovers configured MCP entries without exposing their settings", async (
       },
     });
     assert.equal(fake.calls.length, 1);
-    const overrides = fake.calls[0].args.slice(6);
-    assert.deepEqual(overrides, names.length ? ["-c", 'mcp_servers={"computer-use"={enabled=false},"node_repl"={enabled=false}}'] : []);
+    const overrides = fake.calls[0].args.filter(value => value.startsWith("mcp_servers="));
+    assert.deepEqual(overrides, names.length ? ['mcp_servers={"computer-use"={enabled=false},"node_repl"={enabled=false}}'] : []);
     assert.equal(JSON.stringify(fake.calls).includes("private-setting"), false);
     client.close();
   }
@@ -258,6 +264,7 @@ test("close kills only the child process owned by that client", () => {
 
   firstClient.close();
 
+  assert.notEqual(firstClient.implementationProfile, secondClient.implementationProfile);
   assert.deepEqual(fake.children[0].killedWith, ["SIGTERM"]);
   assert.deepEqual(fake.children[1].killedWith, []);
   secondClient.close();
