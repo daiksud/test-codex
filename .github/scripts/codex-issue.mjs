@@ -783,6 +783,16 @@ export async function startApprovedIssueImplementation(session, approval, receip
   return startAuthorizedIssueTurn(session, profile, prompt);
 }
 
+function issueResumeInstructions(issue, receipt) {
+  return [
+    `The approved Plan is already recorded at ${receipt.url}. Inspect actual local and remote state first. Reuse existing branch and PR when present. Do not recreate an existing branch, replay completed mutations, or create a second PR. Create codex/issue-${issue.number} only if the working branch is absent, and create a PR only if it is absent. Do not repost the Plan. Do not ask for approval or user input. Inspect local and remote state before retrying an operation whose outcome is unknown.`,
+    "Perform Git operations yourself with Git commands. Never push directly to main; do not use worktrees, containers, devcontainers, ephemeral sandboxes, or GitHub Projects. Keep writes within this workspace and avoid changing global configuration or exposing credentials.",
+    "Continue the remaining work, run test/lint/build checks and update Codex verification on every exact PR head. Self-review while CI is pending; add findings to ToDo and fix them. Wait for configured bots and handle valid findings without requesting human review.",
+    "Squash merge only after all required CI succeeds, latest-head bot review is complete, actionable findings are resolved and ToDo is empty. Then return to main, fetch/sync with remote, delete the local working branch and verify a clean working tree and closed Issue.",
+    "Stay within the original 24-hour deadline, automatically retry transient failures, and return the constrained JSON delivery report after checking actual state.",
+  ];
+}
+
 export async function continuePendingIssueDelivery(handoff, outcome) {
   const report = parseIssueDeliveryReport(outcome?.turn);
   if (report.status !== "pending") throw new Error("A completed pending delivery report is required");
@@ -796,14 +806,34 @@ export async function continuePendingIssueDelivery(handoff, outcome) {
   }
   const prompt = [
     `Continue Issue ${issue.url} in this same session from the current workspace. The Issue is the sole specification.`,
-    `The approved Plan is already recorded at ${receipt.url}. Inspect actual local and remote state first. Reuse existing branch and PR when present. Do not recreate an existing branch, replay completed mutations, or create a second PR. Create codex/issue-${issue.number} only if the working branch is absent, and create a PR only if it is absent. Do not repost the Plan. Do not ask for approval or user input. Inspect local and remote state before retrying an operation whose outcome is unknown.`,
-    "Perform Git operations yourself with Git commands. Never push directly to main; do not use worktrees, containers, devcontainers, ephemeral sandboxes, or GitHub Projects. Keep writes within this workspace and avoid changing global configuration or exposing credentials.",
-    "Continue the remaining work, run test/lint/build checks and update Codex verification on every exact PR head. Self-review while CI is pending; add findings to ToDo and fix them. Wait for configured bots and handle valid findings without requesting human review.",
-    "Squash merge only after all required CI succeeds, latest-head bot review is complete, actionable findings are resolved and ToDo is empty. Then return to main, fetch/sync with remote, delete the local working branch and verify a clean working tree and closed Issue.",
-    "Stay within the original 24-hour deadline, automatically retry transient failures, and return the constrained JSON delivery report after checking actual state.",
+    ...issueResumeInstructions(issue, receipt),
     `Pending reason: ${report.reason}\nRemaining ToDo: ${JSON.stringify(report.todo)}`,
     `Approved Plan (verbatim):\n${receipt.approvedPlan}`,
   ].join("\n\n");
+  return startAuthorizedIssueTurn(session, profile, prompt);
+}
+
+export async function retryIssueImplementation(handoff, outcome, {
+  delayMs = 1000, waitBeforeRetry = waitForIssueRetry,
+} = {}) {
+  if (outcome?.turn?.status !== "failed" || !isTransientCodexError(outcome.turn.error?.codexErrorInfo)) {
+    throw new Error("Only a confirmed transient failed Codex turn can be retried");
+  }
+  if (!Number.isFinite(delayMs) || delayMs < 0) throw new Error("Retry delay must be nonnegative and finite");
+  const { session, approval, receipt } = handoff;
+  const { client, deadline, issue } = session;
+  if (deadline.expired) throw deadline.error;
+  requireApprovedIssueReceipt(session, approval, receipt);
+  const profile = client.implementationProfile;
+  if (typeof profile !== "string" || !profile.startsWith("codex_issue_workspace_")) {
+    throw new Error("The owned workspace implementation profile is required");
+  }
+  const prompt = [
+    `Resume Issue ${issue.url} in this same session after a confirmed transient failed SDK turn. The Issue is the sole specification.`,
+    ...issueResumeInstructions(issue, receipt),
+    `Approved Plan (verbatim):\n${receipt.approvedPlan}`,
+  ].join("\n\n");
+  await runIssueSessionStage(session, () => waitBeforeRetry(delayMs, { client, deadline }));
   return startAuthorizedIssueTurn(session, profile, prompt);
 }
 
@@ -1161,7 +1191,7 @@ function requireNoMcpTools(servers) {
   }
 }
 
-function isTransientPlanError(info) {
+function isTransientCodexError(info) {
   if (["rateLimitExceeded", "serverOverloaded", "internalServerError"].includes(info)) {
     return true;
   }
@@ -1284,7 +1314,7 @@ export async function startIssuePlanTurn(client, {
     }
     const result = await readPlanTurnResult(client, threadId, turnId);
     if (result.status === "failed" && attempt < MAX_PLAN_ATTEMPTS &&
-        isTransientPlanError(result.error?.codexErrorInfo)) {
+        isTransientCodexError(result.error?.codexErrorInfo)) {
       await waitBeforeRetry(1000 * 2 ** (attempt - 1), { client, deadline });
       continue;
     }
