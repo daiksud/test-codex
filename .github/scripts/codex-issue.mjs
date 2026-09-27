@@ -955,23 +955,32 @@ export async function runIssueFailureCleanup(session, reason, {
   quiesce = quiesceIssueForCleanup,
   startCleanup = startIssueCleanup,
   readTurn = readIssueImplementationTurn,
+  waitBeforeRetry = waitForIssueRetry,
 } = {}) {
   if (typeof reason !== "string" || !reason.trim()) throw new Error("A nonempty failure reason is required for cleanup");
   if (session.deadline.expired) throw session.deadline.error;
   const context = session.deliveryContext;
   if (!context) throw new Error("Retained approved delivery context is required");
   requireApprovedIssueReceipt(session, context.approval, context.receipt);
-  await runIssueSessionStage(session, () => quiesce(session));
   const handoff = { session, ...context };
-  const turnId = await runIssueSessionStage(session, () => startCleanup(handoff, reason));
-  const turn = await runIssueSessionStage(session, () => readTurn(session, turnId));
-  const cleanupReport = parseIssueDeliveryReport(turn);
-  if (cleanupReport.status !== "failed" || cleanupReport.localBranch !== "main" ||
-      !/^[a-f0-9]{40}$/i.test(cleanupReport.localMainSha ?? "") ||
-      !cleanupReport.clean || cleanupReport.todo.length !== 0) {
-    throw new Error("Cleanup report does not establish clean local main while retaining failed delivery status");
+  for (let attempt = 1; ; attempt += 1) {
+    await runIssueSessionStage(session, () => quiesce(session));
+    const turnId = await runIssueSessionStage(session, () => startCleanup(handoff, reason));
+    const turn = await runIssueSessionStage(session, () => readTurn(session, turnId));
+    if (turn.status === "failed" && isTransientCodexError(turn.error?.codexErrorInfo)) {
+      await runIssueSessionStage(session, () => waitBeforeRetry(Math.min(60000, 1000 * 2 ** (attempt - 1)), {
+        client: session.client, deadline: session.deadline,
+      }));
+      continue;
+    }
+    const cleanupReport = parseIssueDeliveryReport(turn);
+    if (cleanupReport.status !== "failed" || cleanupReport.localBranch !== "main" ||
+        !/^[a-f0-9]{40}$/i.test(cleanupReport.localMainSha ?? "") ||
+        !cleanupReport.clean || cleanupReport.todo.length !== 0) {
+      throw new Error("Cleanup report does not establish clean local main while retaining failed delivery status");
+    }
+    return { status: "failed", cleanupReport };
   }
-  return { status: "failed", cleanupReport };
 }
 
 export async function quiesceIssueForCleanup(session, {
@@ -1043,6 +1052,7 @@ export async function startIssueCleanup(handoff, reason) {
     `The delivery of Issue ${issue.url} failed: ${reason}. The approved Plan remains recorded at ${receipt.url}. This turn is limited to failure cleanup.`,
     "Perform Git operations yourself using Git commands directly. Inspect actual local and remote state and identify Issue-owned changes before cleanup. Fetch the remote main and synchronize local main with it.",
     `Switch to main first, then delete only the local codex/issue-${issue.number} branch if it exists. Never delete main or other local branches. Remove only Issue-owned changes/files needed to restore a clean workspace; preserve unrelated work.`,
+    "Automatically retry transient network/API/service failures within the original hard deadline. Inspect actual local and remote state before retrying an operation whose outcome is unknown, so completed cleanup is not replayed.",
     "Do not begin or resume implementation, commit, push, create or update a PR, or merge. Do not delete remote branches, close the Issue or modify repository settings. Do not ask for approval or user input. Do not change accounts or global configuration, use worktrees/containers/Projects, expose credentials, or write outside the owned workspace.",
     "The original process remains failed regardless of cleanup. Return the constrained JSON report with status failed, the actual local branch/main SHA/clean state and remaining cleanup ToDo. Never claim the original Issue delivery succeeded. Stay within the original hard deadline.",
   ].join("\n\n");

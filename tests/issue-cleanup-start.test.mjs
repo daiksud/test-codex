@@ -74,6 +74,8 @@ test("starts one cleanup-only turn in the approved session and owned profile", a
   assert.match(prompt, /(?:do not|never).*delete.*remote.*branch/i);
   assert.match(prompt, /(?:do not|never).*approval/i);
   assert.match(prompt, /(?:report|status).*failed/i);
+  assert.match(prompt, /retry transient.*(?:network|API).*original.*deadline/i);
+  assert.match(prompt, /inspect.*(?:state|outcome).*before retry.*unknown/is);
 });
 
 test("missing/unapproved receipt and invalid profile cannot authorize cleanup writes", async () => {

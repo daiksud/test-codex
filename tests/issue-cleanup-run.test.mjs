@@ -92,7 +92,7 @@ test("quiesce or ambiguous cleanup startup failure is never replayed or observed
     let attempts = 0;
     fake.options[stage] = async () => {
       attempts += 1;
-      throw new Error("outcome unknown");
+      throw Object.assign(new Error("outcome unknown"), { retryable: true, codexErrorInfo: "serverOverloaded" });
     };
     await assert.rejects(run(fake), /outcome unknown/);
     assert.equal(attempts, 1);
@@ -166,3 +166,77 @@ test("invalid cleanup reasons cannot quiesce or interrupt a turn", async () => {
   }
   assert.deepEqual(fake.calls, []);
 });
+
+test("confirmed transient cleanup turns retry beyond three attempts with fresh inspection and returned IDs", async () => {
+  const fake = fixture();
+  let starts = 0;
+  const delays = [];
+  fake.options.quiesce = async value => {
+    assert.equal(value, fake.session);
+    assert.equal(value.deliveryContext.turnId, starts ? `cleanup-${starts}` : "failed-turn");
+    fake.calls.push("quiesce");
+  };
+  fake.options.startCleanup = async (handoff, reason) => {
+    assert.equal(fake.calls.at(-1), "quiesce");
+    assert.equal(handoff.session, fake.session);
+    assert.equal(handoff.approval, approval);
+    assert.equal(handoff.receipt, receipt);
+    assert.equal(reason, "Original delivery failed");
+    fake.calls.push("start");
+    const id = `cleanup-${++starts}`;
+    fake.session.deliveryContext.turnId = id;
+    return id;
+  };
+  fake.options.readTurn = async (value, id) => {
+    assert.equal(value, fake.session);
+    assert.equal(id, `cleanup-${starts}`);
+    fake.calls.push("observe");
+    return starts <= 8 ? { status: "failed", error: { codexErrorInfo: starts % 2 ? "serverOverloaded" : { httpConnectionFailed: { httpStatusCode: 503 } } } } : fake.turn;
+  };
+  fake.options.waitBeforeRetry = async (delay, options) => {
+    assert.equal(fake.calls.at(-1), "observe");
+    assert.equal(options.client, fake.session.client);
+    assert.equal(options.deadline, fake.session.deadline);
+    delays.push(delay); fake.calls.push("wait");
+  };
+  assert.deepEqual(await run(fake), { status: "failed", cleanupReport });
+  assert.equal(starts, 9);
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000]);
+  assert.deepEqual(fake.calls, [...Array.from({ length: 8 }, () => ["quiesce", "start", "observe", "wait"]).flat(), "quiesce", "start", "observe"]);
+});
+
+test("cleanup permanent, unclassified, interrupted or read failures are not retried", async () => {
+  for (const [status, info] of [
+    ["failed", null], ["failed", "contextWindowExceeded"],
+    ["failed", { httpConnectionFailed: { httpStatusCode: 400 } }],
+    ["failed", { responseTooManyFailedAttempts: { httpStatusCode: null } }],
+    ["interrupted", "serverOverloaded"],
+  ]) {
+    const fake = fixture(); fake.turn.status = status; fake.turn.error = { codexErrorInfo: info };
+    fake.options.waitBeforeRetry = async () => assert.fail("must not retry this failure");
+    await assert.rejects(run(fake), /completed|report/i);
+    assert.deepEqual(fake.calls, ["quiesce", "start", "observe"]);
+  }
+  const fake = fixture();
+  fake.options.readTurn = async () => { throw Object.assign(new Error("read outcome unknown"), { retryable: true }); };
+  fake.options.waitBeforeRetry = async () => assert.fail("unknown read cannot authorize retry");
+  await assert.rejects(run(fake), /read outcome unknown/);
+  assert.deepEqual(fake.calls, ["quiesce", "start"]);
+});
+
+for (const stop of ["deadline", "transport"]) {
+  test(`${stop} during cleanup retry backoff prevents a late cleanup restart`, async () => {
+    const fake = fixture(); fake.turn.status = "failed"; fake.turn.error = { codexErrorInfo: "internalServerError" };
+    let finish, enter;
+    const waiting = new Promise(resolve => { enter = resolve; });
+    fake.options.waitBeforeRetry = async () => new Promise(resolve => { finish = resolve; enter(); });
+    const operation = run(fake);
+    const rejected = assert.rejects(operation, /stopped/); rejected.catch(() => {});
+    await Promise.race([waiting, operation.then(() => { throw new Error("cleanup finished without waiting"); }, () => { throw new Error("cleanup failed without entering retry backoff"); })]);
+    const before = fake.calls.slice();
+    if (stop === "deadline") fake.expire(); else fake.fail();
+    await rejected;
+    finish(); await setImmediate();
+    assert.deepEqual(fake.calls, before);
+  });
+}
