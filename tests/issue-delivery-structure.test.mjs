@@ -27,7 +27,7 @@ function fixture() {
   const payloads = {
     [root + "/issues/19"]: { number: 19, state: "closed" },
     [root + "/pulls/7"]: {
-      number: 7, merged: true,
+      number: 7, merged: true, merged_at: "2026-09-27T00:00:05Z",
       base: { ref: "main", repo: { full_name: repository } },
       head: { ref: "codex/issue-19", sha: headSha, repo: { full_name: repository } },
     },
@@ -64,7 +64,7 @@ function reconcile(fake, value = report, options = {}) {
 
 test("reconciles closed Issue, linked merged PR and synchronized main without full verification", async () => {
   const fake = fixture();
-  assert.deepEqual(await reconcile(fake), { repository, issueNumber: 19, pullRequestNumber: 7, headSha, mainSha });
+  assert.deepEqual(await reconcile(fake), { repository, issueNumber: 19, pullRequestNumber: 7, headSha, mainSha, mergedAt: "2026-09-27T00:00:05Z" });
   assert.equal(fake.calls.length, 4);
   assert.equal(fake.calls.some(call => call.options.method !== "GET"), false);
 });
@@ -174,3 +174,10 @@ for (const stop of ["deadline", "transport"]) {
     assert.equal(signal.aborted, true);
   });
 }
+
+test("merged structural facts require a valid merge timestamp", async () => {
+  for (const value of [undefined, null, "", "not a timestamp", 42]) {
+    const fake = fixture(); fake.payloads[root + "/pulls/7"].merged_at = value;
+    await assert.rejects(reconcile(fake), /merge.*(?:time|timestamp)|merged_at/i);
+  }
+});

@@ -1155,6 +1155,9 @@ export async function reconcileIssueDelivery(session, report, options = {}) {
     throw new Error("PR repository, merge, base branch or head evidence does not match this Issue");
   }
   if (!pr.merged) throw issueDeliveryFinding("PR is not merged");
+  if (typeof pr.merged_at !== "string" || !Number.isFinite(Date.parse(pr.merged_at))) {
+    throw new Error("Invalid PR merge timestamp");
+  }
   let linked = false;
   for (let page = 1; ; page += 1) {
     const events = await get(`${root}/issues/${issueNumber}/timeline?per_page=100&page=${page}`);
@@ -1171,7 +1174,7 @@ export async function reconcileIssueDelivery(session, report, options = {}) {
     throw new Error("Invalid remote main ref or SHA");
   }
   if (main.object.sha !== qualified.localMainSha) throw issueDeliveryFinding("Reported local main does not match remote main");
-  return { repository, issueNumber, pullRequestNumber, headSha: pr.head.sha, mainSha: main.object.sha };
+  return { repository, issueNumber, pullRequestNumber, headSha: pr.head.sha, mainSha: main.object.sha, mergedAt: pr.merged_at };
 }
 
 export async function verifyIssueRequiredCi(session, facts, options = {}) {
@@ -1258,6 +1261,9 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
       !/^[a-f0-9]{40}$/i.test(facts.headSha ?? "")) {
     throw new Error("Bot review facts must match this Issue and a valid PR head");
   }
+  const mergedAt = facts.mergedAt === undefined ? null :
+    typeof facts.mergedAt === "string" ? Date.parse(facts.mergedAt) : NaN;
+  if (mergedAt !== null && !Number.isFinite(mergedAt)) throw new Error("Invalid Bot review merge cutoff timestamp");
   const read = createIssueGitHubReader(session, options);
   const [owner, name] = issue.repository.split("/");
   const number = facts.pullRequestNumber;
@@ -1357,6 +1363,7 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
     }
   } while (cursor !== null);
   let connectorReactionComplete = false;
+  let postMergeEvidence = false;
   const connectorReview = latestReviews.get(ISSUE_REVIEW_BOT);
   if (!connectorReview || connectorReview.commit_id !== facts.headSha) {
     const marker = `<!-- codex-issue-review:${facts.headSha} -->`;
@@ -1375,6 +1382,10 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
             !Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || updatedAt < createdAt) {
           throw new Error("Invalid Bot review request identity or timestamp");
         }
+        if (mergedAt !== null && (createdAt > mergedAt || updatedAt > mergedAt)) {
+          postMergeEvidence = true;
+          continue;
+        }
         if (!newestRequest || createdAt > newestRequest.createdAt ||
             (createdAt === newestRequest.createdAt && comment.id > newestRequest.comment.id)) {
           newestRequest = { comment, createdAt, updatedAt };
@@ -1390,18 +1401,25 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
           if (reaction?.content !== "+1" || reaction.user?.type !== "Bot" ||
               botLogin(reaction.user.login) !== ISSUE_REVIEW_BOT) continue;
           const createdAt = typeof reaction.created_at === "string" ? Date.parse(reaction.created_at) : NaN;
-          if (Number.isFinite(createdAt) && createdAt >= newestRequest.updatedAt) connectorReactionComplete = true;
+          if (Number.isFinite(createdAt) && createdAt >= newestRequest.updatedAt) {
+            if (mergedAt !== null && createdAt > mergedAt) postMergeEvidence = true;
+            else connectorReactionComplete = true;
+          }
         }
         if (reactions.length < 100) break;
       }
     }
   }
+  if (!connectorReactionComplete && postMergeEvidence) throw new Error("Bot review request or reaction occurred after PR merge");
   for (const login of participants) {
     if (login === ISSUE_REVIEW_BOT && connectorReactionComplete) continue;
     const review = latestReviews.get(login);
     if (!review || review.commit_id !== facts.headSha || !["COMMENTED", "APPROVED"].includes(review.state) ||
         typeof review.submitted_at !== "string" || !Number.isFinite(Date.parse(review.submitted_at))) {
       throw issueDeliveryFinding("Bot has no completed review on the latest PR head");
+    }
+    if (mergedAt !== null && Date.parse(review.submitted_at) > mergedAt) {
+      throw new Error("Bot review completed after PR merge");
     }
   }
   return { headSha: facts.headSha, bots: [...participants].sort() };

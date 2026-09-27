@@ -296,3 +296,50 @@ test("a newer untrusted request marker cannot displace an older Actions request"
   assert.deepEqual(await audit(fake), { headSha, bots: [bot.login] });
   assert.equal(fake.calls.some(call => call.url.includes("/issues/comments/43/reactions?")), false);
 });
+
+const mergeTime = "2026-09-27T00:00:05Z";
+test("formal bot reviews must complete before or exactly at the merge cutoff", async () => {
+  for (const submittedAt of ["2026-09-27T00:00:00Z", mergeTime]) {
+    const fake = fixture(); fake.reviews[0] = [{ ...review, submitted_at: submittedAt }];
+    assert.deepEqual(await audit(fake, { ...facts, mergedAt: mergeTime }), { headSha, bots: [bot.login] });
+  }
+  const late = fixture(); late.reviews[0] = [{ ...review, submitted_at: "2026-09-27T00:00:06Z" }];
+  await assert.rejects(audit(late, { ...facts, mergedAt: mergeTime }), error => error.code !== "ISSUE_DELIVERY_FINDING" && /merge|order/i.test(error.message));
+});
+
+test("no-findings reactions must complete before or exactly at merge", async () => {
+  for (const reactedAt of ["2026-09-27T00:00:01Z", mergeTime]) {
+    const fake = thumbFixture(); fake.reactions["42:1"][0].created_at = reactedAt;
+    assert.deepEqual(await audit(fake, { ...facts, mergedAt: mergeTime }), { headSha, bots: [bot.login] });
+  }
+  const late = thumbFixture(); late.reactions["42:1"][0].created_at = "2026-09-27T00:00:06Z";
+  await assert.rejects(audit(late, { ...facts, mergedAt: mergeTime }), error => error.code !== "ISSUE_DELIVERY_FINDING" && /merge|order/i.test(error.message));
+});
+
+test("post-merge-only request markers cannot supply retrospective review completion", async () => {
+  const fake = thumbFixture();
+  Object.assign(fake.reviewComments[0][0], { created_at: "2026-09-27T00:00:06Z", updated_at: "2026-09-27T00:00:06Z" });
+  fake.reactions["42:1"][0].created_at = "2026-09-27T00:00:07Z";
+  await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), error => error.code !== "ISSUE_DELIVERY_FINDING" && /merge|order/i.test(error.message));
+});
+
+test("pre-merge review remains valid after a post-merge non-review response", async () => {
+  const fake = fixture(); fake.reviews[0] = [review, { ...review, body: "", submitted_at: "2026-09-27T00:00:06Z" }];
+  assert.deepEqual(await audit(fake, { ...facts, mergedAt: mergeTime }), { headSha, bots: [bot.login] });
+});
+
+test("invalid supplied merge cutoffs fail before bot requests", async () => {
+  for (const mergedAt of [null, "", "not a timestamp", 42]) {
+    const fake = fixture();
+    await assert.rejects(audit(fake, { ...facts, mergedAt }), /merge.*(?:time|timestamp)|cutoff/i);
+    assert.equal(fake.calls.length, 0);
+  }
+});
+
+test("a marker created after merge cannot displace earlier valid pre-merge evidence", async () => {
+  const fake = thumbFixture();
+  fake.reviewComments[0].push({ ...requestComment, id: 43, html_url: requestComment.html_url.replace("42", "43"), created_at: "2026-09-27T00:00:06Z", updated_at: "2026-09-27T00:00:06Z" });
+  fake.reactions["43:1"] = [{ ...thumbsUp, created_at: "2026-09-27T00:00:07Z" }];
+  assert.deepEqual(await audit(fake, { ...facts, mergedAt: mergeTime }), { headSha, bots: [bot.login] });
+  assert.equal(fake.calls.some(call => call.url.includes("/issues/comments/43/reactions?")), false);
+});

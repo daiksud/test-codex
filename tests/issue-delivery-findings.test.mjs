@@ -11,7 +11,7 @@ function fixture() {
   const calls = [], rpc = [];
   const payloads = {
     [root + "/issues/19"]: { number: 19, state: "closed" },
-    [root + "/pulls/7"]: { number: 7, merged: true, base: { ref: "main", repo: { full_name: repository } }, head: { ref: "codex/issue-19", sha: headSha, repo: { full_name: repository } } },
+    [root + "/pulls/7"]: { number: 7, merged: true, merged_at: "2026-09-27T00:00:05Z", base: { ref: "main", repo: { full_name: repository } }, head: { ref: "codex/issue-19", sha: headSha, repo: { full_name: repository } } },
     [root + "/issues/19/timeline?per_page=100&page=1"]: [{ event: "cross-referenced", source: { issue: { number: 7, repository: { full_name: repository }, pull_request: { url: root + "/pulls/7" } } } }],
     [root + "/git/ref/heads/main"]: { ref: "refs/heads/main", object: { sha: mainSha } },
     [root + "/rules/branches/main"]: [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: "Codex verification" }] } }],

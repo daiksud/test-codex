@@ -13,7 +13,7 @@ function fixture() {
   const payloads = {
     [root + "/issues/19/comments?per_page=100&page=1"]: [comment],
     [root + "/issues/19"]: { number: 19, state: "closed" },
-    [root + "/pulls/7"]: { number: 7, merged: true, base: { ref: "main", repo: { full_name: repository } }, head: { ref: "codex/issue-19", sha: headSha, repo: { full_name: repository } } },
+    [root + "/pulls/7"]: { number: 7, merged: true, merged_at: "2026-09-27T00:00:05Z", base: { ref: "main", repo: { full_name: repository } }, head: { ref: "codex/issue-19", sha: headSha, repo: { full_name: repository } } },
     [root + "/issues/19/timeline?per_page=100&page=1"]: [{ event: "cross-referenced", source: { issue: { number: 7, repository: { full_name: repository }, pull_request: { url: root + "/pulls/7" } } } }],
     [root + "/git/ref/heads/main"]: { ref: "refs/heads/main", object: { sha: mainSha } },
     [root + "/rules/branches/main"]: [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: "Codex verification" }] } }],
@@ -40,7 +40,7 @@ function audit(fake, approved = approval, published = receipt, completed = repor
 
 test("returns only combined remote evidence after approved Plan and every remote audit pass", async () => {
   const fake = fixture();
-  assert.deepEqual(await audit(fake), { repository, issueNumber: 19, pullRequestNumber: 7, headSha, mainSha,
+  assert.deepEqual(await audit(fake), { repository, issueNumber: 19, pullRequestNumber: 7, headSha, mainSha, mergedAt: "2026-09-27T00:00:05Z",
     approvedPlanCommentId: 42, ci: { headSha, requiredContext: "Codex verification" }, botReviews: { headSha, bots: ["chatgpt-codex-connector"] } });
   assert.equal(fake.calls.length, 11);
 });
@@ -101,3 +101,8 @@ for (const stop of ["deadline", "transport"]) {
     rejectStop(new Error("stopped")); await rejected; assert.equal(signal.aborted, true);
   });
 }
+
+test("aggregate completion rejects a genuine review submitted only after PR merge", async () => {
+  const fake = fixture(); fake.payloads[root + "/pulls/7/reviews?per_page=100&page=1"][0].submitted_at = "2026-09-27T00:00:06Z";
+  await assert.rejects(audit(fake), error => error.code !== "ISSUE_DELIVERY_FINDING" && /merge|order/i.test(error.message));
+});
