@@ -13,6 +13,11 @@ jobs:
     if: ${{ github.event.issue.user.login == 'daiksud' }}
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 1439
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: write
     concurrency:
       group: codex-issue-${{ github.repository_id }}
       queue: max
@@ -22,3 +27,7 @@ jobs:
           ref: main
           clean: true
           persist-credentials: true
+      - name: Start Codex Plan
+        run: node .github/scripts/codex-issue.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}

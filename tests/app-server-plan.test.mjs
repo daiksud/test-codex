@@ -1,0 +1,334 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { startIssuePlanTurn } from "../.github/scripts/codex-issue.mjs";
+
+const workspace = "/runner/_work/test-codex/test-codex";
+const issue = {
+  number: 6,
+  title: "PoC: Issue to Codex",
+  body: "Inspect the repository, create a plan, and wait for approval.",
+  url: "https://github.com/daiksud/test-codex/issues/6",
+  repository: "daiksud/test-codex",
+};
+const planText = "1. Inspect the workflow.\n2. Verify its tests.";
+
+class FakeAppServer {
+  constructor({
+    mcpServers = [],
+    mcpPages = null,
+    modes = null,
+    modelPages = null,
+    events = null,
+  } = {}) {
+    this.requests = [];
+    this.notifications = [];
+    this.events =
+      events ?? [
+        {
+          method: "item/completed",
+          params: {
+            threadId: "thread-issue-6",
+            turnId: "turn-plan",
+            item: { id: "item-plan", type: "plan", text: planText },
+          },
+        },
+        {
+          method: "turn/completed",
+          params: {
+            threadId: "thread-issue-6",
+            turn: { id: "turn-plan", status: "completed" },
+          },
+        },
+      ];
+    this.mcpPages = mcpPages ?? [{ data: mcpServers, nextCursor: null }];
+    this.modelPages =
+      modelPages ?? [
+        {
+          data: [
+            { id: "gpt-6-luna", isDefault: false, hidden: false },
+            { id: "gpt-6-sol", isDefault: true, hidden: false },
+          ],
+          nextCursor: null,
+        },
+      ];
+    this.modes =
+      modes ?? [
+        { name: "Plan", mode: "plan", reasoning_effort: "medium" },
+        { name: "Default", mode: "default" },
+      ];
+  }
+
+  async request(method, params = {}) {
+    this.requests.push({ method, params });
+
+    switch (method) {
+      case "initialize":
+        return {};
+      case "mcpServerStatus/list":
+        return this.mcpPages.shift();
+      case "collaborationMode/list":
+        return { data: this.modes };
+      case "model/list":
+        return this.modelPages.shift();
+      case "thread/start":
+        return { thread: { id: "thread-issue-6" } };
+      case "turn/start":
+        return { turn: { id: "turn-plan", status: "inProgress" } };
+      default:
+        throw new Error(`unexpected app-server request: ${method}`);
+    }
+  }
+
+  notify(method, params = {}) {
+    this.notifications.push({ method, params });
+  }
+
+  async nextEvent() {
+    const event = this.events.shift();
+    if (!event) throw new Error("unexpected end of app-server events");
+    return event;
+  }
+}
+
+test("starts one persistent Plan turn with read-only, no-network policy", async () => {
+  const appServer = new FakeAppServer();
+  const result = await startIssuePlanTurn(appServer, { workspace, issue });
+
+  assert.deepEqual(result, {
+    threadId: "thread-issue-6",
+    turnId: "turn-plan",
+    plan: planText,
+  });
+  assert.deepEqual(appServer.notifications, [
+    { method: "initialized", params: {} },
+  ]);
+  assert.deepEqual(
+    appServer.requests.map(({ method }) => method),
+    [
+      "initialize",
+      "mcpServerStatus/list",
+      "collaborationMode/list",
+      "model/list",
+      "thread/start",
+      "turn/start",
+    ],
+  );
+
+  const initialize = appServer.requests[0].params;
+  assert.equal(initialize.capabilities.experimentalApi, true);
+
+  const threadStart = appServer.requests.find(
+    ({ method }) => method === "thread/start",
+  ).params;
+  assert.equal(threadStart.cwd, workspace);
+  assert.equal(threadStart.historyMode, "legacy");
+  assert.equal(threadStart.ephemeral, false);
+  assert.equal(threadStart.sandbox, "read-only");
+  assert.equal(threadStart.approvalPolicy, "never");
+  assert.equal(threadStart.model, "gpt-6-sol");
+
+  const planTurn = appServer.requests.find(
+    ({ method }) => method === "turn/start",
+  ).params;
+  assert.equal(planTurn.threadId, "thread-issue-6");
+  assert.equal(planTurn.cwd, workspace);
+  assert.deepEqual(planTurn.sandboxPolicy, {
+    type: "readOnly",
+    networkAccess: false,
+  });
+  assert.equal(planTurn.collaborationMode.mode, "plan");
+  assert.equal(planTurn.collaborationMode.settings.model, "gpt-6-sol");
+  assert.equal(
+    planTurn.collaborationMode.settings.developer_instructions,
+    null,
+  );
+  assert.equal(planTurn.approvalPolicy, "never");
+  assert.match(planTurn.input[0].text, /Inspect the repository, create a plan/);
+  assert.match(planTurn.input[0].text, /separate unchecked ToDo checklist/);
+  assert.match(
+    planTurn.input[0].text,
+    /Retry transient network\/API\/service failures while the original 24-hour deadline remains, and investigate\/fix code defects, test failures, or review findings instead of retrying them\. Before retrying a non-idempotent write whose outcome is unknown, inspect remote state so an already-applied action is not duplicated\./,
+  );
+  assert.match(planTurn.input[0].text, /wait for approval/);
+  assert.ok(planTurn.input[0].text.includes(issue.url));
+  assert.ok(planTurn.input[0].text.includes(issue.body));
+  assert.equal(
+    appServer.requests.filter(({ method }) => method === "thread/start").length,
+    1,
+  );
+  assert.equal(
+    appServer.requests.filter(({ method }) => method === "turn/start").length,
+    1,
+  );
+});
+
+test("accepts valid final pages when the app-server omits nextCursor", async () => {
+  const appServer = new FakeAppServer({
+    mcpPages: [{ data: [] }],
+    modelPages: [
+      {
+        data: [{ id: "gpt-6-sol", isDefault: true, hidden: false }],
+      },
+    ],
+  });
+  const result = await startIssuePlanTurn(appServer, { workspace, issue });
+
+  assert.equal(result.plan, planText);
+});
+
+test("does not start a Plan thread when an MCP write tool is available", async () => {
+  const appServer = new FakeAppServer({
+    mcpServers: [
+      {
+        name: "github",
+        tools: { create_issue_comment: { description: "Write an issue comment" } },
+      },
+    ],
+  });
+
+  await assert.rejects(
+    startIssuePlanTurn(appServer, { workspace, issue }),
+    /MCP tools must be disabled during Plan/,
+  );
+  assert.equal(
+    appServer.requests.some(({ method }) => method === "thread/start"),
+    false,
+  );
+  assert.equal(
+    appServer.requests.some(({ method }) => method === "turn/start"),
+    false,
+  );
+});
+
+test("discovers MCP tools on later pages before starting a Plan thread", async () => {
+  const appServer = new FakeAppServer({
+    mcpPages: [
+      { data: [], nextCursor: "mcp-page-2" },
+      {
+        data: [
+          {
+            name: "github",
+            tools: { create_issue_comment: { description: "Write a comment" } },
+          },
+        ],
+        nextCursor: null,
+      },
+    ],
+  });
+  await assert.rejects(
+    startIssuePlanTurn(appServer, { workspace, issue }),
+    /MCP tools must be disabled during Plan/,
+  );
+  assert.equal(
+    appServer.requests.filter(({ method }) => method === "mcpServerStatus/list")
+      .length,
+    2,
+  );
+  assert.equal(
+    appServer.requests.some(({ method }) => method === "thread/start"),
+    false,
+  );
+});
+
+test("fails closed when MCP tool discovery returns an error", async () => {
+  const appServer = new FakeAppServer({
+    mcpServers: [
+      { name: "github", tools: {}, toolsError: "tool discovery failed" },
+    ],
+  });
+  await assert.rejects(
+    startIssuePlanTurn(appServer, { workspace, issue }),
+    /MCP tools must be disabled during Plan/,
+  );
+  assert.equal(
+    appServer.requests.some(({ method }) => method === "thread/start"),
+    false,
+  );
+});
+
+test("fails closed when the app-server does not advertise Plan mode", async () => {
+  const appServer = new FakeAppServer({
+    modes: [{ name: "Default", mode: "default" }],
+  });
+  await assert.rejects(
+    startIssuePlanTurn(appServer, { workspace, issue }),
+    /Plan mode is unavailable/,
+  );
+  assert.equal(
+    appServer.requests.some(({ method }) => method === "thread/start"),
+    false,
+  );
+  assert.equal(
+    appServer.requests.some(({ method }) => method === "turn/start"),
+    false,
+  );
+});
+
+test("fails before thread creation when no visible default model exists", async () => {
+  const appServer = new FakeAppServer({
+    modelPages: [
+      {
+        data: [
+          { id: "gpt-6-luna", isDefault: false, hidden: false },
+          { id: "gpt-6-sol-hidden", isDefault: true, hidden: true },
+        ],
+        nextCursor: null,
+      },
+    ],
+  });
+  await assert.rejects(
+    startIssuePlanTurn(appServer, { workspace, issue }),
+    /did not advertise a default model/,
+  );
+  assert.equal(
+    appServer.requests.some(({ method }) => method === "thread/start"),
+    false,
+  );
+});
+
+test("fails a Plan turn that emits a file change or an empty plan", async () => {
+  const changedFile = new FakeAppServer({
+    events: [
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-issue-6",
+          turnId: "turn-plan",
+          item: {
+            id: "item-file-change",
+            type: "fileChange",
+            changes: [{ path: "README.md", kind: "update", diff: "..." }],
+          },
+        },
+      },
+    ],
+  });
+  await assert.rejects(
+    startIssuePlanTurn(changedFile, { workspace, issue }),
+    /Plan turn must not modify files/,
+  );
+
+  const emptyPlan = new FakeAppServer({
+    events: [
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-issue-6",
+          turnId: "turn-plan",
+          item: { id: "item-plan", type: "plan", text: " \n " },
+        },
+      },
+      {
+        method: "turn/completed",
+        params: {
+          threadId: "thread-issue-6",
+          turn: { id: "turn-plan", status: "completed" },
+        },
+      },
+    ],
+  });
+  await assert.rejects(
+    startIssuePlanTurn(emptyPlan, { workspace, issue }),
+    /Plan turn completed without a concrete plan/,
+  );
+});

@@ -74,3 +74,32 @@ test("Codex starts from a clean main checkout in the default workspace", () => {
   const run = blockAtIndent(defaults, 2, "run");
   assert.match(run, /^  run:\n    shell: bash$/m);
 });
+
+test("the guarded job launches the Plan CLI with scoped write permissions", () => {
+  const jobs = blockAtIndent(workflow, 0, "jobs");
+  const processingJob = blockAtIndent(jobs, 2, "codex");
+  const permissions = blockAtIndent(processingJob, 4, "permissions");
+
+  assert.match(permissions, /^    permissions:\n/m);
+  const permissionEntries = permissions
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("      "))
+    .map((line) => line.trim());
+  assert.deepEqual(permissionEntries, [
+    "contents: write",
+    "issues: write",
+    "pull-requests: write",
+    "statuses: write",
+  ]);
+
+  const steps = blockAtIndent(processingJob, 4, "steps");
+  assert.match(steps, /^      - name: Start Codex Plan$/m);
+  const planStepStart = steps.indexOf("      - name: Start Codex Plan");
+  const planStep = steps.slice(planStepStart);
+  assert.match(planStep, /^        run: node \.github\/scripts\/codex-issue\.mjs$/m);
+  assert.match(planStep, /^        env:\n          GH_TOKEN: \$\{\{ github\.token \}\}$/m);
+  assert.ok(
+    steps.indexOf("      - uses: actions/checkout@") < planStepStart,
+    "the checkout must precede the Plan CLI step",
+  );
+});
