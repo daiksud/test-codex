@@ -713,7 +713,12 @@ export async function startApprovedIssueDelivery(session, {
 } = {}) {
   const approval = await runIssueSessionStage(session, () => waitForApproval(session));
   const receipt = await runIssueSessionStage(session, () => postPlan(session, approval));
+  requireApprovedIssueReceipt(session, approval, receipt);
+  const context = { approval: { ...approval }, receipt: { ...receipt }, turnId: null };
+  session.deliveryContext = context;
   const turnId = await runIssueSessionStage(session, () => startImplementation(session, approval, receipt));
+  if (typeof turnId !== "string" || !turnId) throw new Error("Implementation startup did not return a turn ID");
+  context.turnId = turnId;
   return { session, approval, receipt, turnId };
 }
 

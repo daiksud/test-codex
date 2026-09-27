@@ -6,9 +6,16 @@ function fixture() {
   let rejectExpiration, rejectFailure;
   const expiration = new Promise((resolve, reject) => { rejectExpiration = reject; }); expiration.catch(() => {});
   const failure = new Promise((resolve, reject) => { rejectFailure = reject; }); failure.catch(() => {});
-  const session = { threadId: "same-thread", deadline: { expired: false, expiration, error: null }, client: { failure } };
+  const session = { issue: { repository: "daiksud/test-codex", number: 19 }, threadId: "same-thread", deadline: { expired: false, expiration, error: null }, client: { failure } };
   const approval = { approvedPlan: "Edited Plan", approvalTurnId: "ui-turn" };
-  const receipt = { id: 42, approvedPlan: approval.approvedPlan };
+  const receipt = {
+    id: 42,
+    url: "https://github.com/daiksud/test-codex/issues/19#issuecomment-42",
+    threadId: session.threadId,
+    repository: session.issue.repository,
+    issueNumber: session.issue.number,
+    ...approval,
+  };
   const calls = [];
   const options = {
     waitForApproval: async value => { assert.equal(value, session); calls.push("approval"); return approval; },
@@ -69,3 +76,70 @@ for (const stop of ["deadline", "transport"]) {
     }
   });
 }
+
+test("successful publication authority is retained before an uncertain implementation start", async () => {
+  const fake = fixture();
+  fake.options.startImplementation = async () => { throw new Error("start outcome unknown"); };
+  await assert.rejects(handoff(fake), /outcome unknown/);
+  assert.deepEqual(fake.session.deliveryContext, {
+    approval: fake.approval,
+    receipt: fake.receipt,
+    turnId: null,
+  });
+  assert.notEqual(fake.session.deliveryContext.approval, fake.approval);
+  assert.notEqual(fake.session.deliveryContext.receipt, fake.receipt);
+});
+
+test("approval, publication or receipt validation failure retains no cleanup authority", async () => {
+  for (const mode of ["approval", "publication", "receipt"]) {
+    const fake = fixture();
+    if (mode === "approval") fake.options.waitForApproval = async () => { throw new Error("approval failed"); };
+    if (mode === "publication") fake.options.postPlan = async () => { throw new Error("publication failed"); };
+    if (mode === "receipt") {
+      fake.options.postPlan = async () => ({ ...fake.receipt, approvedPlan: "not approved" });
+      fake.options.startImplementation = async () => {
+        fake.calls.push("implementation");
+        return "must-not-start";
+      };
+    }
+    await assert.rejects(handoff(fake), /failed|receipt|publication/i);
+    assert.equal(Object.hasOwn(fake.session, "deliveryContext"), false);
+    assert.equal(fake.calls.includes("implementation"), false);
+  }
+});
+
+test("retained cleanup authority is a snapshot despite changes during startup", async () => {
+  const fake = fixture();
+  const approvalSnapshot = { ...fake.approval };
+  const receiptSnapshot = { ...fake.receipt };
+  fake.options.startImplementation = async (session, approval, receipt) => {
+    assert.equal(session, fake.session);
+    assert.equal(approval, fake.approval);
+    assert.equal(receipt, fake.receipt);
+    assert.deepEqual(session.deliveryContext, {
+      approval: approvalSnapshot,
+      receipt: receiptSnapshot,
+      turnId: null,
+    });
+    approval.approvedPlan = "modified after publication";
+    receipt.approvedPlan = "modified receipt";
+    return "implementation-turn";
+  };
+  await handoff(fake);
+  assert.deepEqual(fake.session.deliveryContext, {
+    approval: approvalSnapshot,
+    receipt: receiptSnapshot,
+    turnId: "implementation-turn",
+  });
+});
+
+test("missing implementation turn ID leaves the retained authority with unknown turn state", async () => {
+  const fake = fixture();
+  fake.options.startImplementation = async () => null;
+  await assert.rejects(handoff(fake), /turn ID/i);
+  assert.deepEqual(fake.session.deliveryContext, {
+    approval: fake.approval,
+    receipt: fake.receipt,
+    turnId: null,
+  });
+});
