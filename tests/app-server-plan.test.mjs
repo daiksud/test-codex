@@ -267,18 +267,60 @@ test("does not retry permanent, unclassified, or interrupted Plan failures", asy
   }
 });
 
-test("stops after three failed Plan attempts with bounded backoff", async () => {
+test("retries Plan failures beyond three attempts until a final Plan succeeds", async () => {
+  const failed = Array.from({ length: 8 }, (_, index) => `attempt-${index + 1}`);
   const client = new FakeAppServer({
-    turnIds: ["attempt-1", "attempt-2", "attempt-3"],
-    events: [1, 2, 3].map((n) => terminalTurn(`attempt-${n}`, "failed", "serverOverloaded")),
+    turnIds: [...failed, "final-attempt"],
+    events: [
+      ...failed.map(id => terminalTurn(id, "failed", "serverOverloaded")),
+      planItem("final-attempt", planText),
+      terminalTurn("final-attempt", "completed"),
+    ],
   });
   const delays = [];
+  const result = await startIssuePlanTurn(client, {
+    workspace,
+    issue,
+    waitBeforeRetry: async ms => delays.push(ms),
+  });
+
+  assert.equal(result.plan, planText);
+  assert.equal(result.turnId, "final-attempt");
+  assert.equal(client.requests.filter(call => call.method === "thread/start").length, 1);
+  const turns = client.requests.filter(call => call.method === "turn/start");
+  assert.equal(turns.length, 9);
+  assert.equal(turns.every(call =>
+    call.params.threadId === "thread-issue-6" && call.params.collaborationMode.mode === "plan"), true);
+  for (const call of turns) {
+    assert.deepEqual(call.params.sandboxPolicy, { type: "readOnly", networkAccess: false });
+  }
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000]);
+});
+
+test("absolute deadline stops Plan retries after several failed attempts without another turn", async () => {
+  const ids = Array.from({ length: 5 }, (_, index) => `attempt-${index + 1}`);
+  const client = new FakeAppServer({
+    turnIds: ids,
+    events: ids.map(id => terminalTurn(id, "failed", "serverOverloaded")),
+  });
+  const deadline = { expired: false, error: null };
+  const delays = [];
   await assert.rejects(startIssuePlanTurn(client, {
-    workspace, issue, waitBeforeRetry: async (ms) => { delays.push(ms); },
-  }), /status failed/);
-  assert.equal(client.requests.filter((r) => r.method === "thread/start").length, 1);
-  assert.equal(client.requests.filter((r) => r.method === "turn/start").length, 3);
-  assert.deepEqual(delays, [1000, 2000]);
+    workspace,
+    issue,
+    deadline,
+    waitBeforeRetry: async ms => {
+      delays.push(ms);
+      if (delays.length === 5) {
+        deadline.expired = true;
+        deadline.error = new Error("absolute deadline expired");
+      }
+    },
+  }), /absolute deadline expired/);
+
+  assert.equal(client.requests.filter(call => call.method === "thread/start").length, 1);
+  assert.equal(client.requests.filter(call => call.method === "turn/start").length, 5);
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000, 16000]);
 });
 
 test("does not replay an ambiguously failed turn-start RPC", async () => {

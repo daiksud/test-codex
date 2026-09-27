@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 export const MAX_ISSUE_RUNTIME_MS = 24 * 60 * 60 * 1000;
-const MAX_PLAN_ATTEMPTS = 3;
 const DELIVERY_REPORT_SCHEMA = {
   type: "object", additionalProperties: false,
   properties: {
@@ -1405,9 +1404,9 @@ export async function startIssuePlanTurn(client, {
       throw new Error("Codex app-server did not return a Plan turn ID");
     }
     const result = await readPlanTurnResult(client, threadId, turnId);
-    if (result.status === "failed" && attempt < MAX_PLAN_ATTEMPTS &&
+    if (result.status === "failed" &&
         isTransientCodexError(result.error?.codexErrorInfo)) {
-      await waitBeforeRetry(1000 * 2 ** (attempt - 1), { client, deadline });
+      await waitBeforeRetry(Math.min(60000, 1000 * 2 ** (attempt - 1)), { client, deadline });
       continue;
     }
     if (result.status !== "completed") {
