@@ -8,12 +8,13 @@ import { promisify } from "node:util";
 export const MAX_ISSUE_RUNTIME_MS = 24 * 60 * 60 * 1000;
 const ISSUE_REVIEW_BOT = "chatgpt-codex-connector";
 const ISSUE_AUTOMATION_BOT = "github-actions";
+const CODEX_NO_FINDINGS_PREFIX = "Codex Review: Didn't find any major issues.";
 const CODEX_REVIEWED_COMMIT_PATTERN = /\*\*Reviewed commit:\*\*\s*`([a-f0-9]{7,40})`/i;
 const ISSUE_BOT_REVIEW_INSTRUCTIONS = `For this repository's configured ${ISSUE_REVIEW_BOT}, request review on every new PR head before merge unless a completed current-head review already exists. Replace FULL_PR_HEAD_SHA with the actual 40-character PR head and use exactly this comment body:
 @codex review
 
 <!-- codex-issue-review:FULL_PR_HEAD_SHA -->
-Inspect existing comments for the exact head marker and reuse a matching request before retrying an uncertain comment POST; do not duplicate it. Wait for a submitted current-head review or the connector's +1 reaction on that request. The connector's no-findings PR comment starting exactly with "Codex Review: Didn't find any major issues. Nice work!" and carrying a Reviewed commit marker matching the current PR head is also a completion path when it follows the matching github-actions[bot]-authored request. All review completion evidence must be no later than PR merge; the controller validates comment identity, URL and timestamps. Resolve all valid findings and do not request human review.`;
+Inspect existing comments for the exact head marker and reuse a matching request before retrying an uncertain comment POST; do not duplicate it. Wait for a submitted current-head review or the connector's +1 reaction on that request. The connector's no-findings PR comment starting exactly with "${CODEX_NO_FINDINGS_PREFIX}" and carrying a Reviewed commit marker matching the current PR head is also a completion path when it follows the matching github-actions[bot]-authored request. All review completion evidence must be no later than PR merge; the controller validates comment identity, URL and timestamps. Resolve all valid findings and do not request human review.`;
 const DELIVERY_REPORT_SCHEMA = {
   type: "object", additionalProperties: false,
   properties: {
@@ -1394,7 +1395,7 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
       for (const comment of comments) {
         const lines = typeof comment?.body === "string" ? comment.body.split(/\r?\n/) : [];
         if (comment.user?.type === "Bot" && botLogin(comment.user.login) === ISSUE_REVIEW_BOT &&
-            lines[0] === "Codex Review: Didn't find any major issues. Nice work!") {
+            lines[0]?.startsWith(CODEX_NO_FINDINGS_PREFIX)) {
           const reviewedCommit = comment.body.match(CODEX_REVIEWED_COMMIT_PATTERN)?.[1];
           if (reviewedCommit && facts.headSha.toLowerCase().startsWith(reviewedCommit.toLowerCase())) noFindingsComments.push(comment);
         }

@@ -397,3 +397,20 @@ test("current-head negative review and unresolved threads still override a no-fi
   const unresolved = noFindingsFixture(); unresolved.threads.first = connection([thread(bot, false)]);
   await assert.rejects(audit(unresolved, { ...facts, mergedAt: mergeTime }), /Bot|thread/i);
 });
+
+
+test("the two observed no-findings greetings share the same verified positive prefix", async () => {
+  for (const greeting of [" Already looking forward to the next diff.", " Nice work!", ""]) {
+    const fake = noFindingsFixture();
+    fake.reviewComments[0][1].body = `Codex Review: Didn't find any major issues.${greeting}\n\n**Reviewed commit:** \`${headSha.slice(0,10)}\``;
+    assert.deepEqual(await audit(fake, { ...facts, mergedAt: mergeTime }), { headSha, bots: [bot.login] });
+  }
+});
+
+test("a different first sentence cannot become no-findings review evidence", async () => {
+  for (const firstLine of ["Codex Review: There are findings. Nice work!", "Codex Review: Didn't find any major issues?", "Not a review. Codex Review: Didn't find any major issues."]) {
+    const fake = noFindingsFixture();
+    fake.reviewComments[0][1].body = `${firstLine}\n\n**Reviewed commit:** \`${headSha.slice(0,10)}\``;
+    await assert.rejects(audit(fake, { ...facts, mergedAt: mergeTime }), /Bot|review/i);
+  }
+});
