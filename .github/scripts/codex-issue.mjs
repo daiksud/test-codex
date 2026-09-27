@@ -547,28 +547,17 @@ export async function waitForIssuePlanApproval(session) {
   }
 }
 
-export async function postApprovedIssuePlan(session, approval, {
+function createIssueGitHubRequests(session, {
   env = process.env, fetchImpl = globalThis.fetch, now = Date.now,
-  waitBeforeRetry = waitForIssueRetry,
 } = {}) {
-  const { issue, threadId, client, deadline } = session;
+  const { client, deadline } = session;
   if (deadline.expired) throw deadline.error;
   const token = env.GH_TOKEN ?? env.GITHUB_TOKEN;
   if (typeof token !== "string" || !token.trim()) throw new Error("GitHub token is required");
   if (!(session.signal instanceof AbortSignal)) throw new Error("Issue cancellation signal is required");
-  if (typeof threadId !== "string" || !threadId ||
-      typeof approval?.approvalTurnId !== "string" || !approval.approvalTurnId ||
-      typeof approval.approvedPlan !== "string" || !approval.approvedPlan.trim()) {
-    throw new Error("A captured nonempty approved Plan is required");
-  }
-  const { approvalTurnId, approvedPlan } = approval;
-  const { repository, number: issueNumber } = issue;
   const stopApi = new AbortController();
   client.failure.catch(error => stopApi.abort(error));
   const lifetime = AbortSignal.any([session.signal, stopApi.signal]);
-  const body = `<!-- codex-approved-plan:${threadId}:${approvalTurnId} -->\n` +
-    `## Approved Codex Plan\n\n${approvedPlan}`;
-  const endpoint = `https://api.github.com/repos/${repository}/issues/${issueNumber}/comments`;
   const headers = {
     Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`,
     "Content-Type": "application/json", "X-GitHub-Api-Version": "2026-03-10",
@@ -633,6 +622,26 @@ export async function postApprovedIssuePlan(session, approval, {
     }
     return data;
   }
+  return { request, bounded, lifetime };
+}
+
+export async function postApprovedIssuePlan(session, approval, {
+  env = process.env, fetchImpl = globalThis.fetch, now = Date.now,
+  waitBeforeRetry = waitForIssueRetry,
+} = {}) {
+  const { issue, threadId, client, deadline } = session;
+  if (deadline.expired) throw deadline.error;
+  const { request, bounded, lifetime } = createIssueGitHubRequests(session, { env, fetchImpl, now });
+  if (typeof threadId !== "string" || !threadId ||
+      typeof approval?.approvalTurnId !== "string" || !approval.approvalTurnId ||
+      typeof approval.approvedPlan !== "string" || !approval.approvedPlan.trim()) {
+    throw new Error("A captured nonempty approved Plan is required");
+  }
+  const { approvalTurnId, approvedPlan } = approval;
+  const { repository, number: issueNumber } = issue;
+  const body = `<!-- codex-approved-plan:${threadId}:${approvalTurnId} -->\n` +
+    `## Approved Codex Plan\n\n${approvedPlan}`;
+  const endpoint = `https://api.github.com/repos/${repository}/issues/${issueNumber}/comments`;
   function result(comment) {
     if (!Number.isSafeInteger(comment?.id) || comment.id <= 0 || comment.body !== body ||
         comment.user?.login !== "github-actions[bot]" ||
