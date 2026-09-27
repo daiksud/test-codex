@@ -135,6 +135,35 @@ test("correlates out-of-order JSONL responses and preserves interleaved events",
   client.close();
 });
 
+test("preserves Japanese Plan text across byte-split UTF-8 JSONL messages", async () => {
+  const text = "日本語の計画 é 🌏";
+  const expectedEvent = {
+    method: "item/completed",
+    params: { item: { type: "plan", text } },
+  };
+  const check = async (response, event) => {
+    assert.deepEqual(await response, { text });
+    assert.deepEqual(await event, expectedEvent);
+  };
+  const fake = fakeSpawner();
+  const client = requireAppServerFactory()({ workspace, spawnProcess: fake.spawnProcess });
+  try {
+    const response = client.request("thread/read");
+    const event = client.nextEvent();
+    const { id } = JSON.parse(fake.children[0].stdinWrites[0]);
+    const bytes = Buffer.from(
+      `${JSON.stringify({ id, result: { text } })}\n${JSON.stringify(expectedEvent)}\n`,
+      "utf8",
+    );
+    for (let index = 0; index < bytes.length; index += 1) {
+      fake.children[0].stdout.write(bytes.subarray(index, index + 1));
+    }
+    await check(response, event);
+  } finally {
+    client.close();
+  }
+});
+
 test("rejects a request cleanly when writing to app-server stdin fails", async () => {
   const spawnCodexAppServer = requireAppServerFactory();
   const fake = fakeSpawner();

@@ -108,8 +108,9 @@ export function spawnCodexAppServer({ workspace, spawnProcess = spawnChild }) {
     }
   }
 
+  child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
-    stdoutBuffer += chunk.toString();
+    stdoutBuffer += chunk;
     let newlineIndex = stdoutBuffer.indexOf("\n");
     while (newlineIndex !== -1) {
       receiveLine(stdoutBuffer.slice(0, newlineIndex));
