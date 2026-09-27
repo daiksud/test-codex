@@ -106,7 +106,7 @@ function fixture() {
     [root + "/rules/branches/main"]: [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: "Codex verification" }] } }],
     [root + `/commits/${headSha}/statuses?per_page=100&page=1`]: [{ context: "Codex verification", state: "success", url: root + `/statuses/${headSha}`, target_url: `https://github.com/${repository}/actions/runs/9001`, creator: { login: "github-actions[bot]" } }],
     [root + `/commits/${headSha}/check-runs?filter=latest&per_page=100&page=1`]: { check_runs: [] },
-    [root + "/pulls/7/reviews?per_page=100&page=1"]: [{ user: { type: "Bot", login: "fixture-review[bot]" }, commit_id: headSha, state: "APPROVED", submitted_at: "2026-09-27T01:00:00Z" }],
+    [root + "/pulls/7/reviews?per_page=100&page=1"]: [{ user: { type: "Bot", login: "chatgpt-codex-connector[bot]" }, commit_id: headSha, state: "APPROVED", submitted_at: "2026-09-27T01:00:00Z" }],
   };
   const fetch = async (input, options) => {
     const url = String(input); const call = { url, method: options.method }; apiCalls.push(call);
@@ -127,7 +127,7 @@ function fixture() {
         call.operationName = body.operationName;
         const field = body.operationName === "IssueReviewRequests" ? "reviewRequests" : "reviewThreads";
         assert.ok(["IssueReviewRequests", "IssueReviewThreads"].includes(body.operationName));
-        const nodes = field === "reviewThreads" ? [{ id: "fixture-thread-review", isResolved: true, comments: { nodes: [{ author: { __typename: "Bot", login: "fixture-review" } }], pageInfo: { hasNextPage: false, endCursor: null } } }] : [];
+        const nodes = field === "reviewThreads" ? [{ id: "fixture-thread-review", isResolved: true, comments: { nodes: [{ author: { __typename: "Bot", login: "chatgpt-codex-connector" } }], pageInfo: { hasNextPage: false, endCursor: null } } }] : [];
         data = { data: { repository: { pullRequest: { number: 7, headRefOid: headSha, [field]: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } } } };
       } else { assert.equal(options.method, "GET"); assert.ok(Object.hasOwn(payloads, url), `unexpected network URL ${url}`); data = payloads[url]; }
     }

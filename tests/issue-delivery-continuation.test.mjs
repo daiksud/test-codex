@@ -32,6 +32,10 @@ test("starts exactly one same-thread continuation with pending context and the s
   assert.equal(params.collaborationMode.settings.reasoning_effort, "high"); assert.deepEqual(params.outputSchema.properties.status.enum, ["pending", "complete", "failed"]);
   const prompt = params.input[0].text;
   for (const text of [...pending.todo, pending.reason, approval.approvedPlan, receipt.url]) assert.ok(prompt.includes(text), text);
+  assert.match(prompt, /chatgpt-codex-connector/);
+  assert.match(prompt, /@codex review/);
+  assert.ok(prompt.includes("@codex review\n\n<!-- codex-issue-review:FULL_PR_HEAD_SHA -->"));
+  assert.match(prompt, /inspect existing comments.*exact head marker.*reuse.*before retrying.*(?:uncertain|unknown).*comment POST/is);
   assert.match(prompt, /current (?:workspace|branch)|existing branch/i);
   assert.match(prompt, /(?:do not|never) (?:re-create|recreate|create).*branch/i);
   assert.match(prompt, /(?:do not|never) (?:repost|re-post|post).*Plan/i);

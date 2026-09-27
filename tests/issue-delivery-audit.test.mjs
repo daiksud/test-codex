@@ -19,7 +19,8 @@ function fixture() {
     [root + "/rules/branches/main"]: [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: "Codex verification" }] } }],
     [root + `/commits/${headSha}/statuses?per_page=100&page=1`]: [{ context: "Codex verification", state: "success", url: root + `/statuses/${headSha}`, target_url: `https://github.com/${repository}/actions/runs/9001`, creator: { login: "github-actions[bot]" } }],
     [root + `/commits/${headSha}/check-runs?filter=latest&per_page=100&page=1`]: { check_runs: [] },
-    [root + "/pulls/7/reviews?per_page=100&page=1"]: [],
+    [root + "/pulls/7/reviews?per_page=100&page=1"]: [{ user: { type: "Bot", login: "chatgpt-codex-connector[bot]" }, state: "COMMENTED", commit_id: headSha, submitted_at: "2026-09-27T00:00:00Z" }],
+    [root + "/issues/7/comments?per_page=100&page=1"]: [],
   };
   const graph = field => ({ data: { repository: { pullRequest: { number: 7, headRefOid: headSha, [field]: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } });
   return { controller, calls, payloads, session: { actionsRunUrl: `https://github.com/${repository}/actions/runs/9001`, issue: { repository, number: 19 }, threadId: receipt.threadId, client: { failure: new Promise(() => {}) }, deadline: { expired: false, expiration: new Promise(() => {}) }, signal: controller.signal },
@@ -40,7 +41,7 @@ function audit(fake, approved = approval, published = receipt, completed = repor
 test("returns only combined remote evidence after approved Plan and every remote audit pass", async () => {
   const fake = fixture();
   assert.deepEqual(await audit(fake), { repository, issueNumber: 19, pullRequestNumber: 7, headSha, mainSha,
-    approvedPlanCommentId: 42, ci: { headSha, requiredContext: "Codex verification" }, botReviews: { headSha, bots: [] } });
+    approvedPlanCommentId: 42, ci: { headSha, requiredContext: "Codex verification" }, botReviews: { headSha, bots: ["chatgpt-codex-connector"] } });
   assert.equal(fake.calls.length, 11);
 });
 

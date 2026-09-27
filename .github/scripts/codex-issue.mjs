@@ -6,6 +6,13 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 export const MAX_ISSUE_RUNTIME_MS = 24 * 60 * 60 * 1000;
+const ISSUE_REVIEW_BOT = "chatgpt-codex-connector";
+const ISSUE_AUTOMATION_BOT = "github-actions";
+const ISSUE_BOT_REVIEW_INSTRUCTIONS = `For this repository's configured ${ISSUE_REVIEW_BOT}, request review on every new PR head before merge unless a completed current-head review already exists. Replace FULL_PR_HEAD_SHA with the actual 40-character PR head and use exactly this comment body:
+@codex review
+
+<!-- codex-issue-review:FULL_PR_HEAD_SHA -->
+Inspect existing comments for the exact head marker and reuse a matching request before retrying an uncertain comment POST; do not duplicate it. Wait for a submitted current-head review or the connector's +1 reaction on that request, resolve all valid findings, and do not request human review.`;
 const DELIVERY_REPORT_SCHEMA = {
   type: "object", additionalProperties: false,
   properties: {
@@ -876,6 +883,7 @@ export async function startApprovedIssueImplementation(session, approval, receip
     "GITHUB_TOKEN pushes do not trigger push CI. For every PR head, report a pending Codex verification commit status with the Actions run URL, execute the repository checks on that exact head, and report success only if those checks succeed. Update the status after every fix.",
     ...(session.actionsRunUrl ? [`Use this exact Actions run URL as the commit status target_url: ${session.actionsRunUrl}.`] : []),
     "While CI is pending, perform self-review, add findings to ToDo and fix them. For bot review, wait for configured bots, address valid findings and obtain a completed review for the latest head. Do not request human review.",
+    ISSUE_BOT_REVIEW_INSTRUCTIONS,
     "Merge only when all required CI is successful, bot review is complete, every actionable finding is resolved, and ToDo is empty. Resolve conflicts without weakening repository protections; squash merge through the PR.",
     "After merge, return to main, fetch and sync with remote, delete the local working branch, and verify a clean working tree. Verify the Issue is closed and do not carry this Issue's state into the next one.",
     "Automatically retry transient network/API/CI/review/service failures within the original 24-hour deadline. Inspect remote state before retrying a mutation with an unknown outcome; investigate and fix code/test/review failures instead of blindly retrying them. On failure, record its reason when possible and perform cleanup yourself.",
@@ -891,6 +899,7 @@ function issueResumeInstructions(issue, receipt) {
     `The approved Plan is already recorded at ${receipt.url}. Inspect actual local and remote state first. Reuse existing branch and PR when present. Do not recreate an existing branch, replay completed mutations, or create a second PR. Create codex/issue-${issue.number} only if the working branch is absent, and create a PR only if it is absent. Do not repost the Plan. Do not ask for approval or user input. Inspect local and remote state before retrying an operation whose outcome is unknown.`,
     "Perform Git operations yourself with Git commands. Never push directly to main; do not use worktrees, containers, devcontainers, ephemeral sandboxes, or GitHub Projects. Keep writes within this workspace and avoid changing global configuration or exposing credentials.",
     "Continue the remaining work, run test/lint/build checks and update Codex verification on every exact PR head. Self-review while CI is pending; add findings to ToDo and fix them. Wait for configured bots and handle valid findings without requesting human review.",
+    ISSUE_BOT_REVIEW_INSTRUCTIONS,
     "Squash merge only after all required CI succeeds, latest-head bot review is complete, actionable findings are resolved and ToDo is empty. Then return to main, fetch/sync with remote, delete the local working branch and verify a clean working tree and closed Issue.",
     "Stay within the original 24-hour deadline, automatically retry transient failures, and return the constrained JSON delivery report after checking actual state.",
   ];
@@ -1237,7 +1246,7 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
   const [owner, name] = issue.repository.split("/");
   const number = facts.pullRequestNumber;
   const variables = { owner, name, number };
-  const participants = new Set();
+  const participants = new Set([ISSUE_REVIEW_BOT]);
   function botLogin(login) {
     if (typeof login !== "string" || !login.replace(/\[bot\]$/, "")) throw new Error("Invalid Bot identity");
     return login.replace(/\[bot\]$/, "");
@@ -1268,7 +1277,10 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
     cursor = page(requests, requestCursors);
     for (const request of requests.nodes) {
       if (typeof request?.requestedReviewer?.__typename !== "string") throw new Error("Invalid requested reviewer");
-      if (request.requestedReviewer.__typename === "Bot") throw issueDeliveryFinding("Bot review request is still pending");
+      if (request.requestedReviewer.__typename === "Bot" &&
+          botLogin(request.requestedReviewer.login) !== ISSUE_AUTOMATION_BOT) {
+        throw issueDeliveryFinding("Bot review request is still pending");
+      }
     }
   } while (cursor !== null);
   const latestReviews = new Map();
@@ -1283,6 +1295,7 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
           throw new Error("Invalid Bot review commit or state");
         }
         const login = botLogin(review.user.login);
+        if (login === ISSUE_AUTOMATION_BOT) continue;
         participants.add(login);
         latestReviews.set(login, review);
       }
@@ -1297,7 +1310,8 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
       for (const comment of comments.nodes) {
         if (typeof comment?.author?.__typename !== "string") throw new Error("Invalid review comment author");
         if (comment.author.__typename === "Bot") {
-          participants.add(botLogin(comment.author.login));
+          const login = botLogin(comment.author.login);
+          if (login !== ISSUE_AUTOMATION_BOT) participants.add(login);
           if (!thread.isResolved) throw issueDeliveryFinding("Unresolved Bot review thread remains");
         }
       }
@@ -1320,10 +1334,50 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
       await inspectComments(thread);
     }
   } while (cursor !== null);
+  let connectorReactionComplete = false;
+  const connectorReview = latestReviews.get(ISSUE_REVIEW_BOT);
+  if (!connectorReview || connectorReview.commit_id !== facts.headSha) {
+    const marker = `<!-- codex-issue-review:${facts.headSha} -->`;
+    let newestRequest = null;
+    for (let index = 1; ; index += 1) {
+      const comments = await read(`https://api.github.com/repos/${issue.repository}/issues/${number}/comments?per_page=100&page=${index}`);
+      if (!Array.isArray(comments)) throw new Error("Invalid Bot review request comments");
+      for (const comment of comments) {
+        const lines = typeof comment?.body === "string" ? comment.body.split(/\r?\n/) : [];
+        if (lines[0] !== "@codex review" || !lines.includes(marker)) continue;
+        const createdAt = typeof comment.created_at === "string" ? Date.parse(comment.created_at) : NaN;
+        const updatedAt = typeof comment.updated_at === "string" ? Date.parse(comment.updated_at) : NaN;
+        if (!Number.isSafeInteger(comment.id) || comment.id <= 0 ||
+            comment.html_url !== `https://github.com/${issue.repository}/pull/${number}#issuecomment-${comment.id}` ||
+            !Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || updatedAt < createdAt) {
+          throw new Error("Invalid Bot review request identity or timestamp");
+        }
+        if (!newestRequest || createdAt > newestRequest.createdAt ||
+            (createdAt === newestRequest.createdAt && comment.id > newestRequest.comment.id)) {
+          newestRequest = { comment, createdAt, updatedAt };
+        }
+      }
+      if (comments.length < 100) break;
+    }
+    if (newestRequest) {
+      for (let index = 1; ; index += 1) {
+        const reactions = await read(`https://api.github.com/repos/${issue.repository}/issues/comments/${newestRequest.comment.id}/reactions?per_page=100&page=${index}`);
+        if (!Array.isArray(reactions)) throw new Error("Invalid Bot review reactions");
+        for (const reaction of reactions) {
+          if (reaction?.content !== "+1" || reaction.user?.type !== "Bot" ||
+              botLogin(reaction.user.login) !== ISSUE_REVIEW_BOT) continue;
+          const createdAt = typeof reaction.created_at === "string" ? Date.parse(reaction.created_at) : NaN;
+          if (Number.isFinite(createdAt) && createdAt >= newestRequest.updatedAt) connectorReactionComplete = true;
+        }
+        if (reactions.length < 100) break;
+      }
+    }
+  }
   for (const login of participants) {
+    if (login === ISSUE_REVIEW_BOT && connectorReactionComplete) continue;
     const review = latestReviews.get(login);
     if (!review || review.commit_id !== facts.headSha || !["COMMENTED", "APPROVED"].includes(review.state) ||
-        typeof review.submitted_at !== "string" || !review.submitted_at) {
+        typeof review.submitted_at !== "string" || !Number.isFinite(Date.parse(review.submitted_at))) {
       throw issueDeliveryFinding("Bot has no completed review on the latest PR head");
     }
   }

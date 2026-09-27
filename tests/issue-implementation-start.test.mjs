@@ -91,6 +91,10 @@ test("starts the same thread with its owned workspace profile and current model"
     assert.ok(prompt.toLowerCase().includes(phrase.toLowerCase()), `missing delivery instruction ${phrase}`);
   }
   assert.match(prompt, /do not (?:ask for|request) human review/i);
+  assert.match(prompt, /chatgpt-codex-connector/);
+  assert.match(prompt, /@codex review/);
+  assert.ok(prompt.includes("@codex review\n\n<!-- codex-issue-review:FULL_PR_HEAD_SHA -->"));
+  assert.match(prompt, /inspect existing comments.*exact head marker.*reuse.*before retrying.*(?:uncertain|unknown).*comment POST/is);
   assert.match(prompt, /(?:Git commands directly|Git operations yourself)/i);
   assert.match(prompt, /(?:never|do not) push directly to main/i);
   assert.match(prompt, /commit.*push.*(?:open|create).*pull request/is);

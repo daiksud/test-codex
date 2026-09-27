@@ -4,20 +4,26 @@ import test from "node:test";
 import * as flow from "../.github/scripts/codex-issue.mjs";
 const repository = "daiksud/test-codex", headSha = "b".repeat(40);
 const facts = { repository, issueNumber: 19, pullRequestNumber: 7, headSha, mainSha: "a".repeat(40) };
-const bot = { __typename: "Bot", login: "fixture-review" };
+const bot = { __typename: "Bot", login: "chatgpt-codex-connector" };
 const human = { __typename: "User", login: "fixture-human" };
-const review = { user: { type: "Bot", login: "fixture-review[bot]" }, state: "COMMENTED", commit_id: headSha, submitted_at: "2026-09-27T00:00:00Z" };
+const review = { user: { type: "Bot", login: "chatgpt-codex-connector[bot]" }, state: "COMMENTED", commit_id: headSha, submitted_at: "2026-09-27T00:00:00Z" };
 function connection(nodes = [], endCursor = null) { return { nodes, pageInfo: { hasNextPage: endCursor !== null, endCursor } }; }
 function thread(author = bot, isResolved = true) { return { id: "fixture-thread", isResolved, comments: connection([{ author }]) }; }
 function fixture() {
   const controller = new AbortController(), calls = [];
-  const reviews = [[]], requests = { first: connection() }, threads = { first: connection() }, comments = {};
+  const reviews = [[review]], reviewComments = [[]], reactions = {}, requests = { first: connection() }, threads = { first: connection() }, comments = {};
   const session = { issue: { repository, number: 19 }, signal: controller.signal, client: { failure: new Promise(() => {}) }, deadline: { expired: false, expiration: new Promise(() => {}) } };
-  const fake = { controller, calls, reviews, requests, threads, comments, session };
+  const fake = { controller, calls, reviews, reviewComments, reactions, requests, threads, comments, session };
   fake.fetchImpl = async (url, options) => {
     calls.push({ url, options });
     let value;
-    if (url.startsWith(`https://api.github.com/repos/${repository}/pulls/7/reviews?`)) {
+    if (url.startsWith(`https://api.github.com/repos/${repository}/issues/7/comments?`)) {
+      assert.equal(options.method, "GET"); value = reviewComments[Number(new URL(url).searchParams.get("page")) - 1];
+    } else if (url.includes("/issues/comments/") && url.includes("/reactions?")) {
+      assert.equal(options.method, "GET");
+      const id = new URL(url).pathname.split("/").at(-2);
+      value = reactions[`${id}:${new URL(url).searchParams.get("page")}`];
+    } else if (url.startsWith(`https://api.github.com/repos/${repository}/pulls/7/reviews?`)) {
       assert.equal(options.method, "GET"); value = reviews[Number(new URL(url).searchParams.get("page")) - 1];
     } else {
       assert.equal(url, "https://api.github.com/graphql"); assert.equal(options.method, "POST");
@@ -40,10 +46,10 @@ function audit(fake, value = facts, options = {}) {
   return flow.verifyIssueBotReviews(fake.session, value, { env: { GH_TOKEN: "fixture-token" }, fetchImpl: fake.fetchImpl, ...options });
 }
 
-test("absent Bot evidence is vacuous and human requests/reviews/threads do not block", async () => {
+test("human requests/reviews/threads do not block the configured Bot completed review", async () => {
   const fake = fixture(); fake.requests.first = connection([{ requestedReviewer: human }]); fake.threads.first = connection([thread(human, false)]);
-  fake.reviews[0] = [{ ...review, user: { type: "User", login: human.login }, state: "CHANGES_REQUESTED" }];
-  assert.deepEqual(await audit(fake), { headSha, bots: [] });
+  fake.reviews[0] = [{ ...review, user: { type: "User", login: human.login }, state: "CHANGES_REQUESTED" }, review];
+  assert.deepEqual(await audit(fake), { headSha, bots: [bot.login] });
 });
 
 test("latest COMMENTED or APPROVED Bot review supersedes historical CHANGES_REQUESTED after resolution", async () => {
@@ -122,7 +128,7 @@ test("retries HTTP200 GraphQL primary rate-limit errors with reset and HTTP503 r
       }
       return fake.fetchImpl(url, options);
     } });
-    assert.deepEqual(result, { headSha, bots: [] }); assert.deepEqual(delays, [mode === "rate" ? 7000 : 1000]);
+    assert.deepEqual(result, { headSha, bots: [bot.login] }); assert.deepEqual(delays, [mode === "rate" ? 7000 : 1000]);
   }
 });
 
@@ -137,3 +143,120 @@ for (const stop of ["deadline", "transport"]) {
     rejectStop(new Error("stopped")); await rejected; assert.equal(signal.aborted, true);
   });
 }
+
+const requestComment = {
+  id: 42, html_url: `https://github.com/${repository}/pull/7#issuecomment-42`,
+  body: `@codex review\n\n<!-- codex-issue-review:${headSha} -->`,
+  created_at: "2026-09-27T00:00:00Z", updated_at: "2026-09-27T00:00:00Z",
+};
+const thumbsUp = { content: "+1", user: { type: "Bot", login: "chatgpt-codex-connector[bot]" }, created_at: "2026-09-27T00:00:01Z" };
+function thumbFixture() {
+  const fake = fixture(); fake.reviews[0] = [];
+  fake.reviewComments[0] = [{ ...requestComment }]; fake.reactions["42:1"] = [{ ...thumbsUp }];
+  return fake;
+}
+
+test("the known configured connector cannot disappear into an empty or unrelated Bot set", async () => {
+  for (const records of [[], [{ ...review, user: { type: "Bot", login: "second-review[bot]" } }]]) {
+    const fake = fixture(); fake.reviews[0] = records;
+    await assert.rejects(audit(fake), error => error.code === "ISSUE_DELIVERY_FINDING" && /Bot|review/i.test(error.message));
+  }
+});
+
+test("a current-head connector thumbs-up completes a no-findings review without a formal object", async () => {
+  const fake = thumbFixture();
+  assert.deepEqual(await audit(fake), { headSha, bots: [bot.login] });
+  assert.ok(fake.calls.some(call => call.url.endsWith("/issues/comments/42/reactions?per_page=100&page=1")));
+  const equality = thumbFixture(); equality.reactions["42:1"][0].created_at = requestComment.updated_at;
+  assert.deepEqual(await audit(equality), { headSha, bots: [bot.login] });
+  const oldReview = thumbFixture(); oldReview.reviews[0] = [{ ...review, state: "CHANGES_REQUESTED", commit_id: "c".repeat(40) }];
+  assert.deepEqual(await audit(oldReview), { headSha, bots: [bot.login] });
+});
+
+test("missing, stale, edited, wrong-actor or non-completion reactions remain incomplete", async () => {
+  for (const mode of ["missing", "head", "quote", "human", "otherBot", "eyes", "old", "edited", "date"]) {
+    const fake = thumbFixture();
+    if (mode === "missing") fake.reactions["42:1"] = [];
+    if (mode === "head") fake.reviewComments[0][0].body = requestComment.body.replace(headSha, "c".repeat(40));
+    if (mode === "quote") fake.reviewComments[0][0].body = "> " + requestComment.body;
+    if (mode === "human") fake.reactions["42:1"][0].user = { type: "User", login: human.login };
+    if (mode === "otherBot") fake.reactions["42:1"][0].user = { type: "Bot", login: "second-review[bot]" };
+    if (mode === "eyes") fake.reactions["42:1"][0].content = "eyes";
+    if (mode === "old") fake.reactions["42:1"][0].created_at = "2026-09-26T23:59:59Z";
+    if (mode === "edited") fake.reviewComments[0][0].updated_at = "2026-09-27T00:00:02Z";
+    if (mode === "date") fake.reactions["42:1"][0].created_at = "not a timestamp";
+    await assert.rejects(audit(fake), /Bot|review|reaction/i);
+  }
+});
+
+test("current-head negative or unsubmitted formal reviews and unresolved findings override thumbs-up", async () => {
+  for (const state of ["CHANGES_REQUESTED", "PENDING", "DISMISSED"]) {
+    const fake = thumbFixture(); fake.reviews[0] = [{ ...review, state }];
+    await assert.rejects(audit(fake), /Bot|review/i);
+  }
+  const unsubmitted = thumbFixture(); unsubmitted.reviews[0] = [{ ...review, submitted_at: null }];
+  await assert.rejects(audit(unsubmitted), /Bot|review/i);
+  const malformed = thumbFixture(); malformed.reviews[0] = [{ ...review, submitted_at: "not a timestamp" }];
+  await assert.rejects(audit(malformed), /Bot|review/i);
+  const unresolved = thumbFixture(); unresolved.threads.first = connection([thread(bot, false)]);
+  await assert.rejects(audit(unresolved), /Bot|thread/i);
+  const other = thumbFixture(); other.threads.first = connection([thread({ __typename: "Bot", login: "second-review" })]);
+  await assert.rejects(audit(other), /Bot|review/i);
+});
+
+test("only the newest same-head marker can provide reaction completion, including timestamp ties", async () => {
+  for (const createdAt of ["2026-09-27T00:00:02Z", requestComment.created_at]) {
+    const fake = thumbFixture();
+    fake.reviewComments[0].push({ ...requestComment, id: 43, html_url: requestComment.html_url.replace("42", "43"), created_at: createdAt, updated_at: createdAt });
+    fake.reactions["43:1"] = [];
+    await assert.rejects(audit(fake), /Bot|review/i);
+    assert.equal(fake.calls.some(call => call.url.includes("/issues/comments/42/reactions?")), false);
+    fake.reactions["43:1"] = [{ ...thumbsUp, created_at: "2026-09-27T00:00:03Z" }];
+    assert.deepEqual(await audit(fake), { headSha, bots: [bot.login] });
+  }
+});
+
+test("paginates request comments and connector reactions without accepting human thumbs", async () => {
+  const fake = thumbFixture();
+  fake.reviewComments[0] = Array.from({ length: 100 }, () => ({ body: "Unrelated comment" }));
+  fake.reviewComments[1] = [requestComment];
+  fake.reactions["42:1"] = Array.from({ length: 100 }, () => ({ ...thumbsUp, user: { type: "User", login: human.login } }));
+  fake.reactions["42:2"] = [thumbsUp];
+  assert.deepEqual(await audit(fake), { headSha, bots: [bot.login] });
+  assert.equal(fake.calls.filter(call => call.url.endsWith("page=2")).length, 2);
+});
+
+test("malformed request identity, timestamps or reaction pages cannot supply completion evidence", async () => {
+  for (const mode of ["id", "url", "wrongPR", "wrongComment", "created", "updated", "ordering", "comments", "reactions"]) {
+    const fake = thumbFixture();
+    if (mode === "id") fake.reviewComments[0][0].id = 0;
+    if (mode === "url") fake.reviewComments[0][0].html_url = "https://example.test/wrong";
+    if (mode === "wrongPR") fake.reviewComments[0][0].html_url = requestComment.html_url.replace("/pull/7", "/pull/8");
+    if (mode === "wrongComment") fake.reviewComments[0][0].html_url = requestComment.html_url.replace("-42", "-43");
+    if (mode === "ordering") fake.reviewComments[0][0].updated_at = "2026-09-26T23:59:59Z";
+    if (mode === "created") fake.reviewComments[0][0].created_at = "not a timestamp";
+    if (mode === "updated") fake.reviewComments[0][0].updated_at = null;
+    if (mode === "comments") fake.reviewComments[0] = {};
+    if (mode === "reactions") fake.reactions["42:1"] = {};
+    await assert.rejects(audit(fake), /Bot|review|reaction|comment/i);
+  }
+});
+
+const actionsWriter = { __typename: "Bot", login: "github-actions" };
+for (const mode of ["request", "review", "reply"]) {
+  test(`the Actions writer ${mode} path does not create an external reviewer obligation`, async () => {
+    const fake = fixture();
+    if (mode === "request") fake.requests.first = connection([{ requestedReviewer: actionsWriter }]);
+    if (mode === "review") fake.reviews[0].push({ ...review, user: { type: "Bot", login: "github-actions[bot]" }, commit_id: "c".repeat(40) });
+    if (mode === "reply") fake.threads.first = connection([thread(actionsWriter)]);
+    assert.deepEqual(await audit(fake), { headSha, bots: [bot.login] });
+  });
+}
+
+test("unresolved Actions-writer replies still block and cannot replace the configured reviewer", async () => {
+  const unresolved = fixture(); unresolved.threads.first = connection([thread(actionsWriter, false)]);
+  await assert.rejects(audit(unresolved), /Bot|thread/i);
+  const missingConnector = fixture(); missingConnector.reviews[0] = [];
+  missingConnector.threads.first = connection([thread(actionsWriter)]);
+  await assert.rejects(audit(missingConnector), error => error.code === "ISSUE_DELIVERY_FINDING" && /Bot|review/i.test(error.message));
+});
