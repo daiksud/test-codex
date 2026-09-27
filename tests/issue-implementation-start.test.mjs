@@ -47,6 +47,15 @@ test("rejects missing or mismatched publication receipts before any RPC", async 
   }
 });
 
+test("rejects empty or missing session and approval-turn IDs before any RPC", async () => {
+  for (const value of ["", undefined]) {
+    const fake = fixture(); fake.session.threadId = value;
+    await assert.rejects(issueFlow.startApprovedIssueImplementation(fake.session, approval, { ...receipt, threadId: value }), /receipt|publication/i); assert.equal(fake.requests.length, 0);
+    const other = fixture();
+    await assert.rejects(issueFlow.startApprovedIssueImplementation(other.session, { ...approval, approvalTurnId: value }, { ...receipt, approvalTurnId: value }), /receipt|publication/i); assert.equal(other.requests.length, 0);
+  }
+});
+
 test("starts the same thread with its owned workspace profile and current model", async () => {
   const fake = fixture();
   assert.equal(await start(fake.session), "implementation-turn");

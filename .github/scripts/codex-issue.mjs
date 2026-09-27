@@ -687,10 +687,11 @@ export async function postApprovedIssuePlan(session, approval, {
   }
 }
 
-export async function startApprovedIssueImplementation(session, approval, receipt) {
-  const { client, deadline, threadId, workspace, issue } = session;
-  if (deadline.expired) throw deadline.error;
-  if (!receipt || !Number.isSafeInteger(receipt.id) || receipt.id <= 0 ||
+function requireApprovedIssueReceipt(session, approval, receipt) {
+  const { issue, threadId } = session;
+  if (typeof threadId !== "string" || !threadId ||
+      typeof approval?.approvalTurnId !== "string" || !approval.approvalTurnId ||
+      !receipt || !Number.isSafeInteger(receipt.id) || receipt.id <= 0 ||
       receipt.threadId !== threadId || receipt.approvalTurnId !== approval?.approvalTurnId ||
       receipt.repository !== issue.repository || receipt.issueNumber !== issue.number ||
       typeof receipt.approvedPlan !== "string" || !receipt.approvedPlan.trim() ||
@@ -698,6 +699,12 @@ export async function startApprovedIssueImplementation(session, approval, receip
       receipt.url !== `https://github.com/${issue.repository}/issues/${issue.number}#issuecomment-${receipt.id}`) {
     throw new Error("An exact matching approved Plan publication receipt is required");
   }
+}
+
+export async function startApprovedIssueImplementation(session, approval, receipt) {
+  const { client, deadline, threadId, workspace, issue } = session;
+  if (deadline.expired) throw deadline.error;
+  requireApprovedIssueReceipt(session, approval, receipt);
   const profile = client.implementationProfile;
   if (typeof profile !== "string" || !profile.startsWith("codex_issue_workspace_")) {
     throw new Error("The owned workspace implementation profile is required");
@@ -980,6 +987,36 @@ export async function verifyIssueBotReviews(session, facts, options = {}) {
     }
   }
   return { headSha: facts.headSha, bots: [...participants].sort() };
+}
+
+export async function verifyIssueDelivery(session, approval, receipt, report, options = {}) {
+  const qualified = parseIssueDeliveryReport({ status: "completed", text: JSON.stringify(report) });
+  if (qualified.status !== "complete") throw new Error("A qualified complete delivery report is required");
+  const { issue, threadId } = session;
+  requireApprovedIssueReceipt(session, approval, receipt);
+  const { id, url, approvedPlan, approvalTurnId } = receipt;
+  const body = `<!-- codex-approved-plan:${threadId}:${approvalTurnId} -->\n` +
+    `## Approved Codex Plan\n\n${approvedPlan}`;
+  const read = createIssueGitHubReader(session, options);
+  let found = false;
+  for (let page = 1; ; page += 1) {
+    const comments = await read(`https://api.github.com/repos/${issue.repository}/issues/${issue.number}/comments?per_page=100&page=${page}`);
+    if (!Array.isArray(comments)) throw new Error("Invalid approved Plan comments response");
+    const comment = comments.find(comment => comment?.id === id);
+    if (comment) {
+      if (comment.html_url !== url || comment.body !== body || comment.user?.login !== "github-actions[bot]") {
+        throw new Error("Approved Plan comment no longer matches the publication receipt");
+      }
+      found = true;
+      break;
+    }
+    if (comments.length < 100) break;
+  }
+  if (!found) throw new Error("Approved Plan comment is missing");
+  const facts = await reconcileIssueDelivery(session, qualified, options);
+  const ci = await verifyIssueRequiredCi(session, facts, options);
+  const botReviews = await verifyIssueBotReviews(session, facts, options);
+  return { ...facts, approvedPlanCommentId: id, ci, botReviews };
 }
 
 function issuePlanPrompt(issue) {
